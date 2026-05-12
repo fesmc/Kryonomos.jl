@@ -28,4 +28,7 @@ LocalPreferences.toml
 JuliaLocalPreferences.toml
 
 # Output files generated in the test folder, so ignore test by default
-test
+test/run*
+examples/run*
+*/ice_data
+*/isostasy_data

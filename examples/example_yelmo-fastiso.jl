@@ -64,24 +64,17 @@ yelmo_out = init_output(ylmo, joinpath(ylmo.rundir, "yelmo.nc"),
 )
 write_output!(yelmo_out, ylmo)
 
-# Time loop (Yelmo only — coupling lands in commit 4)
-for t in T(time_init):T(dt):T(time_end)
-    Yelmo.step!(ylmo, t - ylmo.time)
+# Coupled time loop
+for t in dt:dt:time_end
+    push_ice!(sim, ylmo)
+    FastIsostasy.step!(integrator, T(dt), true)
+    pull_bedrock!(ylmo, sim)
+    Yelmo.step!(ylmo, dt)
     write_output!(yelmo_out, ylmo)
+    println("t=$t  extrema(u)=$(extrema(sim.now.u))  extrema(z_bed)=$(extrema(ylmo.bnd.z_bed))")
 end
 
 close(yelmo_out)
 
 # Plot some data
 heatmap(ylmo.dyn.uxy_s, colorscale = log10)
-
-# Standalone FastIsostasy smoke test — step the integrator forward by
-# `dt` repeatedly with H_ice held at zero. Confirms FastIsostasy
-# initializes and integrates cleanly before we couple it in commit 4.
-println("FastIsostasy smoke test:")
-println("  initial extrema(u)  = ", extrema(sim.now.u))
-println("  initial extrema(ue) = ", extrema(sim.now.ue))
-for t in T(time_init):T(dt):T(time_end - dt)
-    FastIsostasy.step!(integrator, T(dt), true)
-    println("  t=$(t + dt)  extrema(u)=$(extrema(sim.now.u))  extrema(ue)=$(extrema(sim.now.ue))")
-end

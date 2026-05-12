@@ -22,14 +22,18 @@ ylmo.bnd.H_sed .= 100.0;
 init_state!(ylmo, 0.0; thrm_method="robin-cold");
 
 # Initialize FastIsostasy ##########
-# Standalone setup (no coupling to Yelmo yet — grid is hardcoded).
-# Commit 3 will derive the domain from Yelmo's grid.
+# Identical-grid coupling: FastIsostasy uses the same (Nx, Ny, dx, dy)
+# as Yelmo so push/pull is a plain broadcast copy. To run FastIsostasy
+# on a different grid, swap `push_ice!` / `pull_bedrock!` below for
+# interpolating versions.
 
 T = Float32
 time_init, time_end, dt = 0.0, 5.0, 1.0
 t_out = collect(T(time_init):T(dt):T(time_end))
 
-domain = RegionalDomain(T(3500e3), T(3500e3), 64, 64)
+Nx, Ny = ylmo.g.Nx, ylmo.g.Ny
+Wx, Wy = T(ylmo.g.Δxᶜᵃᵃ * Nx), T(ylmo.g.Δyᵃᶜᵃ * Ny)
+domain = RegionalDomain(Wx, Wy, Nx, Ny)
 bcs = BoundaryConditions(domain, ice_thickness = ExternallyUpdatedIceThickness())
 sealevel = RegionalSeaLevel(
     surface = LaterallyVariableSeaSurface(),
@@ -42,6 +46,15 @@ sim = Simulation(domain, bcs, sealevel, solidearth,
     nout = NativeOutput(t = t_out),
 )
 integrator = init_integrator(sim)
+
+# Coupling helpers (identical-grid case — for a different FastIsostasy
+# grid, swap these for interpolating versions).
+push_ice!(sim, ylmo) = (sim.now.H_ice .= ylmo.tpo.H_ice; nothing)
+pull_bedrock!(ylmo, sim) = begin
+    ylmo.bnd.z_bed .= ylmo.bnd.z_bed_ref .+ sim.now.u .+ sim.now.ue
+    ylmo.bnd.z_sl  .= sim.now.z_ss
+    return nothing
+end
 
 # Initialize Yelmo output file ####
 yelmo_out = init_output(ylmo, joinpath(ylmo.rundir, "yelmo.nc"),

@@ -1,80 +1,165 @@
-## Preamble #############################################
+## Preamble ############################################################
 cd(@__DIR__)
 import Pkg; Pkg.activate(".")
-#########################################################
+#######################################################################
 
 using Revise
 using CairoMakie
 using Oceananigans.Fields
 using Oceananigans.Grids
+using Oceananigans.AbstractOperations: Average
 using Yelmo
 using FastIsostasy
+using IceSheetBenchmarks
+using Statistics
+using FastHydrology
 
-# Initialize Yelmo #################
+# ── Constants ─────────────────────────────────────────────────────────────────
 
-p = YelmoParameters("Greenland")
-ylmo = YelmoMirror(p, 0.0; rundir="run01", overwrite=true);
+const YELMO_PROJECT            = "/Users/taange001/Documents/Coding/Yelmo.jl"
+const ICE_SHEET_BENCHMARKS_PROJECT = joinpath(YELMO_PROJECT, "benchmarks/IceSheetBenchmarks")
+const RUN_DIR                  = @__DIR__
+const DATA_DIR                 = joinpath(YELMO_PROJECT, "benchmarks/initmip-grl/data/GRL-16KM")
 
-# Populate boundary fields
-ylmo.bnd.H_sed .= 100.0;
+const YELMO_NML          = "/Users/taange001/Documents/Coding/Kryonomos.jl/examples/run01/Greenland.nml"
+const YELMO_REGIONS_FILE = joinpath(DATA_DIR, "GRL-16KM_REGIONS.nc")
+const YELMO_BASINS_FILE  = joinpath(DATA_DIR, "GRL-16KM_BASINS-nasa.nc")
+const YELMO_TOPO_FILE    = joinpath(DATA_DIR, "GRL-16KM_TOPO-M17-v5.nc")
 
-# Initialize Yelmo state
-init_state!(ylmo, 0.0; thrm_method="robin-cold");
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-# Initialize FastIsostasy ##########
-# Identical-grid coupling: FastIsostasy uses the same (Nx, Ny, dx, dy)
-# as Yelmo so push/pull is a plain broadcast copy. To run FastIsostasy
-# on a different grid, swap `push_ice!` / `pull_bedrock!` below for
-# interpolating versions.
-
-T = Float32
-time_init, time_end, dt = 0.0, 5.0, 1.0
-t_out = collect(T(time_init):T(dt):T(time_end))
-
-Nx, Ny = ylmo.g.Nx, ylmo.g.Ny
-Wx, Wy = T(ylmo.g.Δxᶜᵃᵃ * Nx), T(ylmo.g.Δyᵃᶜᵃ * Ny)
-domain = RegionalDomain(Wx, Wy, Nx, Ny)
-bcs = BoundaryConditions(domain, ice_thickness = ExternallyUpdatedIceThickness())
-sealevel = RegionalSeaLevel(
-    surface = LaterallyVariableSeaSurface(),
-    load    = NoSealevelLoad(),
-    bsl     = PiecewiseConstantBSL(),
-)
-solidearth = SolidEarth(domain)
-sim = Simulation(domain, bcs, sealevel, solidearth,
-    (T(time_init), T(time_end));
-    nout = NativeOutput(t = t_out),
-)
-integrator = init_integrator(sim)
-
-# Coupling helpers (identical-grid case — for a different FastIsostasy
-# grid, swap these for interpolating versions).
-push_ice!(sim, ylmo) = (sim.now.H_ice .= ylmo.tpo.H_ice; nothing)
-pull_bedrock!(ylmo, sim) = begin
-    ylmo.bnd.z_bed .= ylmo.bnd.z_bed_ref .+ sim.now.u .+ sim.now.ue
-    ylmo.bnd.z_sl  .= sim.now.z_ss
-    return nothing
+"""Replace field `f` in struct `s` with value `v`, returning a new instance."""
+function _override_field(s, f::Symbol, v)
+    vals = (n === f ? v : getfield(s, n) for n in fieldnames(typeof(s)))
+    return typeof(s)(vals...)
 end
 
-# Initialize Yelmo output file ####
-yelmo_out = init_output(ylmo, joinpath(ylmo.rundir, "yelmo.nc"),
-    selection = OutputSelection(
-        groups = [:tpo, :dyn, :thrm, :mat, :bnd],
-    )
-)
-write_output!(yelmo_out, ylmo)
-
-# Coupled time loop
-for t in dt:dt:time_end
-    push_ice!(sim, ylmo)
-    FastIsostasy.step!(integrator, T(dt), true)
-    pull_bedrock!(ylmo, sim)
-    Yelmo.step!(ylmo, dt)
-    write_output!(yelmo_out, ylmo)
-    println("t=$t  extrema(u)=$(extrema(sim.now.u))  extrema(z_bed)=$(extrema(ylmo.bnd.z_bed))")
+"""Compute a lazy `BinaryOperation` and return the interior 2-D slice."""
+function _compute_interior(op)
+    result = Field(op)
+    compute!(result)
+    return interior(result, :, :, 1)
 end
 
+# ── Yelmo setup ───────────────────────────────────────────────────────────────
+
+function build_yelmo_parameters()
+    p = YelmoModelParameters(YELMO_NML, "Greenland")
+
+    init_topo = _override_field(p.yelmo_init_topo, :init_topo_path, YELMO_TOPO_FILE)
+
+    masks = _override_field(p.yelmo_masks, :regions_path, YELMO_REGIONS_FILE)
+    masks = _override_field(masks,         :basins_path,   YELMO_BASINS_FILE)
+
+    p = _override_field(p, :yelmo_init_topo, init_topo)
+    p = _override_field(p, :yelmo_masks,     masks)
+
+    return p
+end
+
+function build_yelmo()
+    mkpath(RUN_DIR)
+
+    for (path, label) in [
+        (YELMO_NML,          "Yelmo namelist"),
+        (YELMO_REGIONS_FILE, "regions file"),
+        (YELMO_BASINS_FILE,  "basins file"),
+        (YELMO_TOPO_FILE,    "topography file"),
+    ]
+        isfile(path) || error("Yelmo $label not found: $path")
+    end
+
+    p         = build_yelmo_parameters()
+    benchmark = InitMIPGRLBenchmark(YELMO_REGIONS_FILE)
+    y         = YelmoModel(benchmark, 0.0; p, boundaries=:bounded, rundir=RUN_DIR)
+
+    init_topo_load!(y; grad_lim_zb=p.ytopo.grad_lim_zb)
+    init_masks!(y)
+    fill!(interior(y.bnd.H_sed), 100.0)
+
+    return p, y
+end
+
+p, yelmo = build_yelmo()
+
+yelmo.bnd.H_sed .= 100.0
+init_state!(yelmo, 0.0; thrm_method="robin-cold")
+
+# ── FastHydrology setup ───────────────────────────────────────────────────────
+
+const T = Float32
+
+time_init, time_end, dt = 0.0, 1.0, 1.0   # years
+
+Nx, Ny = yelmo.g.Nx, yelmo.g.Ny
+xlims  = (0, T(yelmo.g.Δxᶜᵃᵃ * Nx))
+ylims  = (0, T(yelmo.g.Δyᵃᶜᵃ * Ny))
+
+# Initial fields from Yelmo
+mask      = _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd) .> 0
+h         = interior(yelmo.tpo.H_ice,    :, :, 1)   # ice thickness
+b         = interior(yelmo.bnd.z_bed,    :, :, 1)   # bedrock elevation
+abs_v_b   = interior(yelmo.dyn.uxy_b,   :, :, 1)   # basal speed
+A_visc    = mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1]   # depth-averaged rate factor
+mdot      = perYear2perSecond.(yelmo.thrm.bmb_grnd)          # basal melt rate [kg m⁻² s⁻¹]
+kappa     = zeros(T, Nx, Ny)                                  # bed hardness (0: hard, 1: soft)
+
+const LONGCOUPWATER = 0.0   # smoothing of geometric-potential gradients
+const FILL_ITERS    = 10    # iterations to fill local minima in potential field
+
+grid  = OGRectHydroGrid(yelmo.g)
+model = KazmierczakHydroModel(grid, kappa, abs_v_b, A_visc, mdot;
+                               longcoupwater=LONGCOUPWATER, fill_iters=FILL_ITERS)
+state = HydroState(grid, mask, h, b)
+sim   = SteadyStateSimulation(model, grid, state)
+
+# ── Coupling functions ────────────────────────────────────────────────────────
+
+"""Copy Yelmo fields → FastHydrology state/model."""
+function yelmo_to_FastHydrology!(sim, yelmo)
+    sim.state.mask  .= _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd) .> 0
+    sim.state.h     .= interior(yelmo.tpo.H_ice,  :, :, 1)
+    sim.state.b     .= interior(yelmo.bnd.z_bed,  :, :, 1)
+
+    sim.model.abs_v_b .= interior(yelmo.dyn.uxy_b, :, :, 1)
+    sim.model.A_visc  .= mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1]
+    sim.model.mdot    .= perYear2perSecond.(interior(yelmo.thrm.bmb_grnd, :, :, 1))
+    sim.model.kappa   .= zeros(T, Nx, Ny)
+end
+
+"""Copy FastHydrology outputs → Yelmo boundary fields."""
+function FastHydrology_to_yelmo!(yelmo, sim)
+    yelmo.dyn.N_eff .= sim.state.N   # effective pressure
+    yelmo.thrm.H_w  .= sim.state.W   # subglacial water thickness
+end
+
+# ── Output ────────────────────────────────────────────────────────────────────
+
+const YELMO_OUTPUT_GROUPS = [:tpo, :dyn, :thrm, :mat, :bnd]
+
+yelmo_out = init_output(yelmo, joinpath(yelmo.rundir, "yelmo.nc"); selection=OutputSelection(groups=YELMO_OUTPUT_GROUPS))
+write_output!(yelmo_out, yelmo)
+
+# ── Coupled time loop ─────────────────────────────────────────────────────────
+
+function run!()
+    for t in dt:dt:time_end
+        # yelmo_to_FastHydrology!(sim, yelmo)
+        # FastHydrology.run!(sim)
+        # FastHydrology_to_yelmo!(yelmo, sim)
+        Yelmo.step!(yelmo, dt)
+        write_output!(yelmo_out, yelmo)
+        println("t = $t yr")
+    end
+end
+
+@time run!()
 close(yelmo_out)
 
-# Plot some data
-heatmap(ylmo.dyn.uxy_s, colorscale = log10)
+# ── Diagnostics ───────────────────────────────────────────────────────────────
+
+fig = Figure()
+ax  = Axis(fig[1, 1])
+hm  = heatmap!(ax, interior(yelmo.thrm.bmb_grnd, :, :, 1), colorscale = log10)
+Colorbar(fig[1, 2], hm)
+display(fig)

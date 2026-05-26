@@ -32,3 +32,5 @@ test/run*
 examples/run*
 */ice_data
 */isostasy_data
+
+.DS_Store

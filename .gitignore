@@ -34,3 +34,4 @@ examples/run*
 */isostasy_data
 
 .DS_Store
+yelmo.nc

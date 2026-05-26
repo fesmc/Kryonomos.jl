@@ -160,6 +160,6 @@ close(yelmo_out)
 
 fig = Figure()
 ax  = Axis(fig[1, 1])
-hm  = heatmap!(ax, interior(yelmo.thrm.bmb_grnd, :, :, 1), colorscale = log10)
+hm  = heatmap!(ax, interior(yelmo.thrm.bmb_grnd, :, :, 1))
 Colorbar(fig[1, 2], hm)
 display(fig)

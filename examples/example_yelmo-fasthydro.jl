@@ -213,8 +213,11 @@ function build_hydrology_sim_Shakti(yelmo)
 
     grid = Shakti.Grid(Nx, Ny, T((Nx - 1) * dx), T((Ny - 1) * dy))
 
-    # Shakti's own mask (0/1/2/3 = grounded/ocean/land/other-basin) is a separate concept from
-    # FastHydrology's HydroState.mask, and static for the whole run -- set only here, not per step.
+    # Shakti's GROUNDED is the same physical concept as FastHydrology's HydroState.mask == 1
+    # (grounded ice present) -- just one of four categories here (vs a boolean there), since
+    # Shakti also needs to distinguish ocean/land/other-basin among the non-grounded cells that
+    # K24/HAB never look at. Built independently (not derived from a HydroState), and static for
+    # the whole run -- set only here, not per step.
     grounded_frac = _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd)
     zb0 = interior(yelmo.bnd.z_bed, :, :, 1)
     mask = fill(Shakti.OTHER_BASIN, Nx, Ny)
@@ -231,8 +234,13 @@ function build_hydrology_sim_Shakti(yelmo)
     mask[:, [1, Ny]] .= Shakti.OTHER_BASIN
 
     zb     = zb0
-    zs     = interior(yelmo.tpo.z_srf, :, :, 1)
     H      = interior(yelmo.tpo.H_ice, :, :, 1)
+    # Shakti derives H = zs - zb - b internally (compute_H!), so zs must be reconstructed as
+    # zb + H_ice here rather than read from yelmo.tpo.z_srf directly: z_srf is referenced to sea
+    # level (0 over open ocean), not to zb + H_ice, so feeding it in directly would make Shakti
+    # read open-ocean bathymetry as if it were ice thickness (matches Shakti's own real-glacier
+    # example, Helheim.jl, which builds zs the same way).
+    zs     = zb .+ H
     A_visc = perYear2perSecond.(mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1])
     ub_x   = perYear2perSecond.(interior(yelmo.dyn.ux_b, :, :, 1))
     ub_y   = perYear2perSecond.(interior(yelmo.dyn.uy_b, :, :, 1))
@@ -262,17 +270,32 @@ end
 
 """Push Yelmo's current ice geometry, rheology, and basal stress/velocity into the wrapped Shakti
 simulation. Shakti's mask is static per run (set only in build_hydrology_sim_Shakti), so it is not
-touched here."""
+touched here. Unlike `set_initial_conditions!`, Shakti's own per-timestep `step!` does *not*
+re-derive H/po/abs_ub from zs/zb/ub_x/ub_y on its own (only `set_initial_conditions!` and
+`compute_beta!` -- called internally each step -- touch those), so this has to call the matching
+`compute_*!` refreshers explicitly after pushing the raw fields, or the coupling would silently
+keep using the ice geometry/velocity from `build_hydrology_sim_Shakti`'s initial call forever."""
 function Yelmo_to_FastHydrology_Shakti!(shakti_sim, yelmo)
-    shakti_sim.state.zb     .= interior(yelmo.bnd.z_bed, :, :, 1)
-    shakti_sim.state.zs     .= interior(yelmo.tpo.z_srf, :, :, 1)
-    shakti_sim.state.H      .= interior(yelmo.tpo.H_ice, :, :, 1)
-    shakti_sim.state.A_visc .= perYear2perSecond.(mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1])
-    shakti_sim.state.ub_x   .= perYear2perSecond.(interior(yelmo.dyn.ux_b, :, :, 1))
-    shakti_sim.state.ub_y   .= perYear2perSecond.(interior(yelmo.dyn.uy_b, :, :, 1))
-    shakti_sim.state.taub_x .= interior(yelmo.dyn.taub_acx, :, :, 1)
-    shakti_sim.state.taub_y .= interior(yelmo.dyn.taub_acy, :, :, 1)
-    shakti_sim.state.G      .= interior(yelmo.bnd.Q_geo, :, :, 1) .* 1e-3
+    s = shakti_sim.state
+
+    s.zb .= interior(yelmo.bnd.z_bed, :, :, 1)
+    H_ice = interior(yelmo.tpo.H_ice, :, :, 1)
+    # Reconstructed as zb + H_ice, not read from yelmo.tpo.z_srf -- see build_hydrology_sim_Shakti's
+    # comment: z_srf is sea-level-referenced over open ocean, not zb + H_ice, and Shakti's own
+    # H = zs - zb - b derivation would otherwise read ocean depth as ice thickness there.
+    s.zs .= s.zb .+ H_ice
+
+    s.A_visc .= perYear2perSecond.(mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1])
+    s.ub_x   .= perYear2perSecond.(interior(yelmo.dyn.ux_b, :, :, 1))
+    s.ub_y   .= perYear2perSecond.(interior(yelmo.dyn.uy_b, :, :, 1))
+    s.taub_x .= interior(yelmo.dyn.taub_acx, :, :, 1)
+    s.taub_y .= interior(yelmo.dyn.taub_acy, :, :, 1)
+    s.G      .= interior(yelmo.bnd.Q_geo, :, :, 1) .* 1e-3
+
+    Shakti.apply_mask_to_sliding!(s)   # re-zero ub_x/ub_y on any face touching an OTHER_BASIN cell
+    Shakti.compute_abs_ub!(s)          # |u_b| from the new ub_x/ub_y
+    Shakti.compute_H!(s)               # ice thickness from the new zs/zb/b
+    Shakti.compute_po!(s, shakti_sim.p) # overburden pressure from the new H
 end
 
 """Copy Shakti's effective pressure / gap height back into Yelmo boundary fields. Shakti's state

@@ -36,3 +36,9 @@ examples/plots/
 
 .DS_Store
 yelmo.nc
+
+examples/logs/
+
+# Cluster-only job scripts and their logs -- never meant to be committed
+*.sbatch
+slurm_*.sh

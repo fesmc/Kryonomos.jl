@@ -42,3 +42,6 @@ examples/logs/
 # Cluster-only job scripts and their logs -- never meant to be committed
 *.sbatch
 slurm_*.sh
+
+# Personal learning scripts -- kept private, not meant for GitHub
+examples/tutorial/

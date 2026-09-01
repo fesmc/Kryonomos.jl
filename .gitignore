@@ -52,3 +52,6 @@ examples/mismip1d/
 examples/isolation/
 examples/debug/
 examples/archive/
+
+# Symlinks into a separate Fortran yelmo checkout on this machine, not repo content
+examples/input/

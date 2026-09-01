@@ -30,5 +30,28 @@ JuliaLocalPreferences.toml
 # Output files generated in the test folder, so ignore test by default
 test/run*
 examples/run*
+examples/plots/
 */ice_data
 */isostasy_data
+
+.DS_Store
+yelmo.nc
+
+examples/logs/
+
+# Cluster-only job scripts and their logs -- never meant to be committed
+*.sbatch
+slurm_*.sh
+
+# Personal learning scripts -- kept private, not meant for GitHub
+examples/tutorial/
+
+# Cluster tidy: testing/scratch example dirs -- exploratory work run on albedo0,
+# not the polished examples/ this repo is meant to showcase (those are fastisostasy/ and fasthydrology/).
+examples/mismip1d/
+examples/isolation/
+examples/debug/
+examples/archive/
+
+# Symlinks into a separate Fortran yelmo checkout on this machine, not repo content
+examples/input/

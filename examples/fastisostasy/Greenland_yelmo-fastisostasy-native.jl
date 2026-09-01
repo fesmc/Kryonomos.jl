@@ -1,5 +1,8 @@
 ## Preamble #############################################
-cd(@__DIR__)
+# Run from examples/: that is where Project.toml/Manifest.toml live, and where the
+# Fortran side resolves its relative input/ paths and ice_data/. This script lives
+# one level down, so cd to the parent rather than to @__DIR__.
+cd(dirname(@__DIR__))
 import Pkg; Pkg.activate(".")
 #########################################################
 

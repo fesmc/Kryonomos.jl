@@ -47,7 +47,7 @@ slurm_*.sh
 examples/tutorial/
 
 # Cluster tidy: testing/scratch example dirs -- exploratory work run on albedo0,
-# not the polished examples/ this repo is meant to showcase (that's fasthydro_coupling/).
+# not the polished examples/ this repo is meant to showcase (those are fastisostasy/ and fasthydrology/).
 examples/mismip1d/
 examples/isolation/
 examples/debug/

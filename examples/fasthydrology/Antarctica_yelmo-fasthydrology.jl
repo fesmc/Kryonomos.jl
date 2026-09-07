@@ -376,7 +376,7 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
     ub_y   = perYear2perSecond.(interior(yelmo.dyn.uy_b, :, :, 1))
     taub_x = interior(yelmo.dyn.taub_acx, :, :, 1)   # already in Pa, no time unit to convert
     taub_y = interior(yelmo.dyn.taub_acy, :, :, 1)
-    G      = interior(yelmo.bnd.Q_geo, :, :, 1) .* 1e-3   # mW/m^2 -> W/m^2
+    G      = interior(yelmo.bnd.Q_geo, :, :, 1) .* 1e-3   # mW/m^2 -> W/m^2 - WARNING: this field might contain a -9999.0 fill sentinel
     gap0   = fill(1e-3, Nx, Ny)   # initial gap height guess; no Yelmo equivalent
     ieb    = zeros(Nx, Ny)        # no explicit moulin coupling (see docstring above)
 

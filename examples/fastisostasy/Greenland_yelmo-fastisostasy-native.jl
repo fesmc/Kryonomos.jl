@@ -1,9 +1,11 @@
 ## Preamble #############################################
-# Run from examples/: that is where Project.toml/Manifest.toml live, and where the
-# Fortran side resolves its relative input/ paths and ice_data/. This script lives
-# one level down, so cd to the parent rather than to @__DIR__.
-cd(dirname(@__DIR__))
-import Pkg; Pkg.activate(".")
+# Fortran side resolves its relative input/ paths and ice_data/ against examples/,
+# so cd to the parent even though this script's own environment (Project.toml with
+# the FastIsostasy dep, kept separate from the shared examples/ env because
+# FastIsostasy's ParallelStencil compat conflicts with Shakti's) lives alongside it.
+SCRIPT_DIR = @__DIR__
+cd(dirname(SCRIPT_DIR))
+import Pkg; Pkg.activate(SCRIPT_DIR)
 #########################################################
 
 # Coupled Yelmo + FastIsostasy example using the *native* (pure-Julia)

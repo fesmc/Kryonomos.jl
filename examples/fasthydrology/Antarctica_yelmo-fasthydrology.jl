@@ -27,8 +27,8 @@ using Yelmo
 using Yelmo: YelmoMirror                       # Fortran-backed backend: same physics, same nml,
                                                  # same data -- ccall into libyelmo_c_api.so instead
                                                  # of running Julia code directly.
-using Yelmo.YelmoPar: YelmoParameters           # YelmoMirror's parameter type (structurally the
-                                                 # same nml blocks as YelmoModelParameters, plus
+using Yelmo.YelmoMirrorPar: YelmoMirrorParameters  # YelmoMirror's parameter type (structurally the
+                                                 # same nml blocks as YelmoParameters, plus
                                                  # p.phys since Mirror keeps constants Fortran-side).
 using IceSheetBenchmarks
 using Statistics
@@ -97,7 +97,7 @@ const FROZEN_BED_THRESHOLD = nothing # e.g. 0.0 to opt in
 # couple_step!, step!, run!) is reused unchanged across both backends -- they only touch
 # interior(...) fields, which both backends expose identically. What differs is model
 # construction (build_yelmo vs build_yelmo_mirror) and how the "N_eff is set externally" flag
-# is expressed: yneff.method = -1 in Julia's YelmoModelParameters vs. hyd.is_external = true in
+# is expressed: yneff.method = -1 in Julia's YelmoParameters vs. hyd.is_external = true in
 # Fortran's &yhyd (see yelmo/src/yelmo_dynamics.f90::calc_ydyn_neff's hyd%par%is_external
 # bypass, added specifically so an external host can push N_eff into YelmoMirror the same way).
 const BACKEND = lowercase(get(ENV, "FASTHYDRO_BACKEND", "yelmo"))
@@ -146,7 +146,7 @@ own method = 3 (van Pelt & Bueler till closure): nothing would ever push N_eff f
 method = -1 it would stay at its Field-allocation default (zero) for the whole run -- a
 frictionless bed."""
 function build_yelmo_parameters(; external_neff::Bool)
-    p = YelmoModelParameters(YELMO_NML, "Antarctica")
+    p = YelmoParameters(YELMO_NML, "Antarctica")
 
     # YELMO_NML (shared with the Greenland script) has domain = "Greenland" baked into its
     # &yelmo block; override it explicitly since nothing else here re-derives it from the
@@ -190,7 +190,7 @@ function build_yelmo(; external_neff::Bool)
     end
 
     p         = build_yelmo_parameters(; external_neff)
-    benchmark = InitMIPGRLBenchmark(YELMO_REGIONS_FILE)
+    benchmark = InitMIPBenchmark(YELMO_REGIONS_FILE)
     y         = YelmoModel(benchmark, 0.0; p, boundaries=:bounded, rundir=RUN_DIR)
 
     init_topo_load!(y; grad_lim_zb=p.ytopo.grad_lim_zb)
@@ -210,7 +210,7 @@ N_eff every step. "No coupling" must pass `external_neff = false` and keep the s
 from `hyd%now%N` (FastHydrology's till closure) every step -- nothing ever pushes N_eff for
 that branch, same reasoning as `yneff.method = 3` on the Julia side."""
 function build_yelmo_parameters_mirror(; external_neff::Bool)
-    p = YelmoParameters(YELMO_NML_MIRROR, "Antarctica")
+    p = YelmoMirrorParameters(YELMO_NML_MIRROR, "Antarctica")
 
     if external_neff
         hyd = _override_field(p.hyd, :is_external, true)
@@ -379,6 +379,21 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
     end
     mask[[1, Nx], :] .= Shakti.OTHER_BASIN   # close off the domain edge (closed-boundary convention)
     mask[:, [1, Ny]] .= Shakti.OTHER_BASIN
+
+    # A GROUNDED cell with no GROUNDED neighbour has no flow path into the rest of the domain:
+    # every face conductance touching it comes out zero (Shakti.boundary_K_face needs both sides
+    # GROUNDED to be nonzero), and the Newton-linearized creep-closure reaction term vanishes too
+    # once effective pressure goes deeply negative there (as it does at a thin, near-flotation
+    # single-pixel grounded cell) -- so its assembled row is an exact zero, and CholeskyDirectSolver's
+    # factorization fails with PosDefException. Reclassify such cells as OTHER_BASIN (frozen/inert,
+    # same treatment as a genuinely disconnected grounded-ice basin) rather than solving for them.
+    for j in 2:(Ny - 1), i in 2:(Nx - 1)
+        if mask[i, j] == Shakti.GROUNDED
+            has_grounded_neighbor = mask[i+1, j] == Shakti.GROUNDED || mask[i-1, j] == Shakti.GROUNDED ||
+                                     mask[i, j+1] == Shakti.GROUNDED || mask[i, j-1] == Shakti.GROUNDED
+            has_grounded_neighbor || (mask[i, j] = Shakti.OTHER_BASIN)
+        end
+    end
 
     zb     = zb0
     H      = interior(yelmo.tpo.H_ice, :, :, 1)

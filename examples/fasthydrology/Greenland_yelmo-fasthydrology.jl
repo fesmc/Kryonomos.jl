@@ -57,6 +57,18 @@ const RHO_I = 917.0
 const DT_YR       = 2.0
 const TIME_END_YR = 4.0
 
+# Whether the Shakti coupling additionally tracks a dynamic frozen bed, and if so at what
+# threshold: `nothing` (default) disables it entirely -- Shakti's mask stays exactly as
+# build_hydrology_sim_Shakti's own one-time GROUNDED/OCEAN/LAND/OTHER_BASIN classification set it,
+# matching every existing run exactly. A `Float64` enables it: every couple_step! reclassifies
+# grounded cells between GROUNDED and FROZEN_BED from Yelmo's live f_pmp (`yelmo.thrm.f_pmp`,
+# fraction of a cell at the pressure-melting point -- 0 fully frozen, 1 fully temperate) via
+# `update_frozen_bed!` below, freezing a cell once `f_pmp <= threshold` and thawing it once
+# `f_pmp > threshold`. No hysteresis band -- a cell sitting exactly at the threshold could flip
+# every step; tighten this into a two-threshold band if that ever shows up as chatter in practice.
+# K24/HAB have no FROZEN_BED concept, so this is ignored on those branches even if set.
+const FROZEN_BED_THRESHOLD = nothing # e.g. 0.0 to opt in
+
 # ── Backend selection ────────────────────────────────────────────────────────
 # "yelmo" (default) — pure-Julia YelmoModel, as this script has always run.
 # "mirror"           — YelmoMirror, the Fortran-backed backend (ccall into libyelmo_c_api.so).
@@ -206,10 +218,15 @@ abstract type HydrologyCoupling end
 """Fully coupled: Yelmo ↔ FastHydrology exchange each timestep. `S` is whichever FastHydrology
 simulation type (`SteadyStateSimulation{KazmierczakHydroModel}`, `SteadyStateSimulation{HABHydroModel}`,
 or `TimeSimulation{ShaktiHydroModel}`) `build_hydrology_sim_*` below produced -- `couple_step!`
-dispatches on `sim.model`'s type to run the right coupling for whichever one is active."""
-struct CoupledHydrology{S} <: HydrologyCoupling
+dispatches on `sim.model`'s type to run the right coupling for whichever one is active.
+
+`frozen_bed_threshold`: see [`FROZEN_BED_THRESHOLD`](@ref)'s own definition above -- forwarded to
+`couple_step!` every step (only the Shakti method does anything with it)."""
+struct CoupledHydrology{S, FB} <: HydrologyCoupling
     sim::S
+    frozen_bed_threshold::FB
 end
+CoupledHydrology(sim; frozen_bed_threshold = nothing) = CoupledHydrology(sim, frozen_bed_threshold)
 
 """No hydrology: Yelmo advances alone."""
 struct NoCoupling <: HydrologyCoupling end
@@ -402,6 +419,27 @@ function Yelmo_to_FastHydrology_Shakti!(shakti_sim, yelmo)
     Shakti.compute_po!(s, shakti_sim.p) # overburden pressure from the new H
 end
 
+"""Reclassifies grounded cells between GROUNDED and FROZEN_BED each coupling step, driven by
+Yelmo's live `f_pmp` (fraction of a cell at the pressure-melting point -- `yelmo.thrm.f_pmp`, 0
+fully frozen, 1 fully temperate; see [`FROZEN_BED_THRESHOLD`](@ref)'s own definition). A
+currently-GROUNDED cell freezes once `f_pmp <= threshold`; a currently-FROZEN_BED cell thaws once
+`f_pmp > threshold` -- no hysteresis band, see FROZEN_BED_THRESHOLD's own caveat on that. Only
+called when `threshold !== nothing` (see `couple_step!(::ShaktiHydroModel, ...)` below).
+
+Delegates the actual mask/state bookkeeping to `Shakti.freeze_cells!`/`Shakti.thaw_cells!`
+(`frozen_bed.jl`), which are otherwise "not yet wired to any automatic driver" per their own
+docstring -- this is that driver, for the Shakti coupling specifically. Both calls are safe to run
+unconditionally against the same `is_frozen`/`.!is_frozen` pair: `freeze_cells!` only touches
+cells currently GROUNDED and `thaw_cells!` only touches cells currently FROZEN_BED, so neither
+disturbs an OCEAN/LAND/OTHER_BASIN cell even though `is_frozen` also covers those."""
+function update_frozen_bed!(shakti_sim, yelmo, threshold)
+    f_pmp = interior(yelmo.thrm.f_pmp, :, :, 1)
+    is_frozen = f_pmp .<= threshold
+    Shakti.freeze_cells!(shakti_sim.state, shakti_sim.p, is_frozen)
+    Shakti.thaw_cells!(shakti_sim.state, shakti_sim.p, .!is_frozen)
+    return nothing
+end
+
 """Copy Shakti's effective pressure / gap height back into Yelmo boundary fields. Shakti's state
 arrays are plain (Nx, Ny) arrays (unlike K24/HAB's Oceananigans fields), hence writing through
 `interior(...)` on the Yelmo side."""
@@ -413,31 +451,34 @@ end
 # ── Coupling dispatch (per active FastHydrology model) ────────────────────────
 
 """Advance the hydrology model by one Yelmo timestep and push results back, dispatched on
-whichever FastHydrology model is active in `sim`."""
-function couple_step!(::KazmierczakHydroModel, sim, yelmo, dt)
+whichever FastHydrology model is active in `sim`. `frozen_bed_threshold` (see
+[`FROZEN_BED_THRESHOLD`](@ref)) is accepted by every method for a uniform call site in `step!`
+below, but only the Shakti method does anything with it -- K24/HAB have no FROZEN_BED concept."""
+function couple_step!(::KazmierczakHydroModel, sim, yelmo, dt; frozen_bed_threshold = nothing)
     Yelmo_to_FastHydrology_K24!(sim, yelmo)
     FastHydrology.run!(sim)
     FastHydrology_to_Yelmo_K24!(yelmo, sim)
 end
 
-function couple_step!(::HABHydroModel, sim, yelmo, dt)
+function couple_step!(::HABHydroModel, sim, yelmo, dt; frozen_bed_threshold = nothing)
     Yelmo_to_FastHydrology_HAB!(sim, yelmo)
     FastHydrology.run!(sim)
     FastHydrology_to_Yelmo_HAB!(yelmo, sim)
 end
 
-function couple_step!(model::ShaktiHydroModel, sim, yelmo, dt)
+function couple_step!(model::ShaktiHydroModel, sim, yelmo, dt; frozen_bed_threshold = nothing)
     shakti_sim = model.sim
     # shakti_sim.dt was set to dt_yr * SECONDS_PER_YEAR at construction (build_hydrology_sim_Shakti)
     # -- if the caller ever runs this coupling with a different outer dt than it was built with,
     # one Shakti step would silently cover the wrong span of Yelmo time. Guard rather than let that
     # drift silently.
     dt_seconds = dt * FastHydrology.SECONDS_PER_YEAR
-    isapprox(dt_seconds, shakti_sim.dt; rtol=1e-8) || error(
+    isapprox(dt_seconds, shakti_sim.dt[]; rtol=1e-8) || error(
         "couple_step! (Shakti): outer dt = $dt yr ($dt_seconds s) does not match " *
-        "shakti_sim.dt = $(shakti_sim.dt) s -- rebuild the Shakti sim with the dt actually used by run!.")
+        "shakti_sim.dt[] = $(shakti_sim.dt[]) s -- rebuild the Shakti sim with the dt actually used by run!.")
 
     Yelmo_to_FastHydrology_Shakti!(shakti_sim, yelmo)
+    frozen_bed_threshold !== nothing && update_frozen_bed!(shakti_sim, yelmo, frozen_bed_threshold)
     FastHydrology.step!(sim)   # one Shakti step == one Yelmo step (dt matched, see above)
     FastHydrology_to_Yelmo_Shakti!(yelmo, shakti_sim)
 end
@@ -446,7 +487,7 @@ end
 
 """Single timestep with active hydrology coupling."""
 function step!(coupling::CoupledHydrology, yelmo, t, dt)
-    couple_step!(coupling.sim.model, coupling.sim, yelmo, dt)
+    couple_step!(coupling.sim.model, coupling.sim, yelmo, dt; frozen_bed_threshold = coupling.frozen_bed_threshold)
     Yelmo.step!(yelmo, dt)
 end
 
@@ -530,7 +571,7 @@ function main()
         yelmo -> NoCoupling(),
         yelmo -> CoupledHydrology(build_hydrology_sim_K24(yelmo)),
         yelmo -> CoupledHydrology(build_hydrology_sim_HAB(yelmo)),
-        yelmo -> CoupledHydrology(build_hydrology_sim_Shakti(yelmo, DT_YR)),
+        yelmo -> CoupledHydrology(build_hydrology_sim_Shakti(yelmo, DT_YR); frozen_bed_threshold = FROZEN_BED_THRESHOLD),
     ]
 
     # See BRANCH_SEL's definition above: unset runs all four branches in this one process

@@ -78,9 +78,12 @@ const FROZEN_BED_THRESHOLD = nothing # e.g. 0.0 to opt in
 # couple_step!, step!, run!) is reused unchanged across both backends -- they only touch
 # interior(...) fields, which both backends expose identically. What differs is model
 # construction (build_yelmo vs build_yelmo_mirror) and how the "N_eff is set externally" flag
-# is expressed: yneff.method = -1 in Julia's YelmoParameters vs. hyd.is_external = true in
-# Fortran's &yhyd (see yelmo/src/yelmo_dynamics.f90::calc_ydyn_neff's hyd%par%is_external
-# bypass, added specifically so an external host can push N_eff into YelmoMirror the same way).
+# is expressed: yneff.method = -1 in Julia's YelmoParameters (dyn.N_eff left alone) vs.
+# hyd.bkt_N_closure = -1 in Fortran's &yhyd (N_CLOSURE_EXTERNAL -- apply_N_closure leaves
+# hyd%now%N untouched) plus pushing N via the C API's hyd_N setter (yelmo_set_var2D,
+# case("hyd_N")): calc_ydyn_neff's dyn%now%N_eff = hyd%now%N fast path then
+# carries the pushed value through. Yelmo.jl's yelmo_sync! already pushes ylmo.dyn.N_eff under
+# both cnames, so writing yelmo.dyn.N_eff in *_to_Yelmo_*! below reaches Fortran either way.
 const BACKEND = lowercase(get(ENV, "FASTHYDRO_BACKEND", "yelmo"))
 BACKEND in ("yelmo", "mirror") ||
     error("FASTHYDRO_BACKEND must be 'yelmo' or 'mirror', got '$BACKEND'")
@@ -174,19 +177,19 @@ function build_yelmo(; external_neff::Bool)
 end
 
 """Mirror counterpart of `build_yelmo_parameters`. `external_neff = true` overrides
-`hyd.is_external` to `true` -- the &yhyd equivalent of the Julia backend's `yneff.method = -1`
+`hyd.bkt_N_closure` to `-1` -- the &yhyd equivalent of the Julia backend's `yneff.method = -1`
 (see `build_yelmo_parameters`'s docstring for the full rationale, and
 `yelmo/src/yelmo_dynamics.f90::calc_ydyn_neff` for the Fortran-side bypass this flag controls).
 Same contract as the Julia backend: only appropriate for a branch that will actually push
 N_eff every step. "No coupling" must pass `external_neff = false` and keep the shared nml's own
-&yhyd default (`is_external = false`), so `calc_ydyn_neff` keeps recomputing `dyn%now%N_eff`
+&yhyd default (`bkt_N_closure = 3`, till closure), so `calc_ydyn_neff` keeps recomputing `dyn%now%N_eff`
 from `hyd%now%N` (FastHydrology's till closure) every step -- nothing ever pushes N_eff for
 that branch, same reasoning as `yneff.method = 3` on the Julia side."""
 function build_yelmo_parameters_mirror(; external_neff::Bool)
     p = YelmoMirrorParameters(YELMO_NML_MIRROR, "Greenland")
 
     if external_neff
-        hyd = _override_field(p.hyd, :is_external, true)
+        hyd = _override_field(p.hyd, :bkt_N_closure, -1)
         p   = _override_field(p, :hyd, hyd)
     end
 
@@ -543,7 +546,7 @@ function setup_yelmo(; external_neff::Bool)
     end
 
     if external_neff
-        # With N_eff set externally (yneff.method = -1 / hyd.is_external = true for
+        # With N_eff set externally (yneff.method = -1 / hyd.bkt_N_closure = -1 for
         # external_neff branches), calc_ydyn_neff! is a no-op, so without this N_eff would still
         # be sitting at its Field-allocation default (zero) for that first solve -- a
         # frictionless bed, which is what made the SSA solver diverge before this was added.

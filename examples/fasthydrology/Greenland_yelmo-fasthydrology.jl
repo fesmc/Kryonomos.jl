@@ -57,6 +57,21 @@ const RHO_I = 917.0
 const DT_YR       = 2.0
 const TIME_END_YR = 4.0
 
+# Shakti is a genuinely prognostic hydrology model with its own stable timestep (its author runs
+# it uncoupled at 1-3 hours) -- coupling it at DT_YR (2 *years*) as if it were steady-state like
+# K24/HAB is what caused the instability seen validating this script under YelmoMirror (beta
+# collapsing to zero, thermal NaN by ~t=6.8yr): Shakti was being asked to jump 2 years per Picard
+# solve, far outside where its own physics is valid. Fixed by decoupling Shaktis own DT_YR/TIME_END_YR:
+# ice flow evolves at the same cadence Shakti steps at (dt_ice = dt_hydro), rather than holding ice
+# fixed over a multi-year Shakti step or sub-cycling Shakti under a fixed ice state -- both were
+# options; this one doubles as a real test of the coupling at Shaktis native timescale, at the
+# cost of a much shorter total run than the K24/HAB branches (a full 40yr run at 1-3 hours/step is
+# 100k+ steps, impractical here).
+const DT_SHAKTI_HOURS     = get(ENV, "DT_SHAKTI_HOURS", "2.0")
+const DT_SHAKTI_YR        = parse(Float64, DT_SHAKTI_HOURS) / (24.0 * 365.25)
+const TIME_END_SHAKTI_DAYS = get(ENV, "TIME_END_SHAKTI_DAYS", "5.0")
+const TIME_END_SHAKTI_YR  = parse(Float64, TIME_END_SHAKTI_DAYS) / 365.25
+
 # Whether the Shakti coupling additionally tracks a dynamic frozen bed, and if so at what
 # threshold: `nothing` (default) disables it entirely -- Shakti's mask stays exactly as
 # build_hydrology_sim_Shakti's own one-time GROUNDED/OCEAN/LAND/OTHER_BASIN classification set it,
@@ -589,7 +604,7 @@ function main()
         yelmo -> NoCoupling(),
         yelmo -> CoupledHydrology(build_hydrology_sim_K24(yelmo)),
         yelmo -> CoupledHydrology(build_hydrology_sim_HAB(yelmo)),
-        yelmo -> CoupledHydrology(build_hydrology_sim_Shakti(yelmo, DT_YR); frozen_bed_threshold = FROZEN_BED_THRESHOLD),
+        yelmo -> CoupledHydrology(build_hydrology_sim_Shakti(yelmo, DT_SHAKTI_YR); frozen_bed_threshold = FROZEN_BED_THRESHOLD),
     ]
 
     # See BRANCH_SEL's definition above: unset runs all four branches in this one process
@@ -610,8 +625,12 @@ function main()
         # yelmo_out = init_output(yelmo, joinpath(yelmo.rundir, "yelmo.nc"); selection=OutputSelection(groups=yelmo_output_groups))
         # write_output!(yelmo_out, yelmo)
 
-        # Run the total time simulation
-        @time run!(coupling, yelmo; dt=DT_YR, time_end=TIME_END_YR)
+        # Run the total time simulation. Shakti runs at its own much shorter/finer
+        # dt/time_end (see DT_SHAKTI_YR/TIME_END_SHAKTI_YR above) -- everything else keeps
+        # the shared DT_YR/TIME_END_YR.
+        dt_this       = idx == 4 ? DT_SHAKTI_YR       : DT_YR
+        time_end_this = idx == 4 ? TIME_END_SHAKTI_YR : TIME_END_YR
+        @time run!(coupling, yelmo; dt=dt_this, time_end=time_end_this)
 
         # close(yelmo_out)
 

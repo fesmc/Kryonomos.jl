@@ -76,6 +76,20 @@ const RHO_I = 917.0
 const DT_YR       = 2.0
 const TIME_END_YR = 4.0
 
+# Shakti is a genuinely prognostic hydrology model with its own stable timestep (its author runs
+# it uncoupled at 1-3 hours) -- coupling it at DT_YR (2 *years*) as if it were steady-state like
+# K24/HAB is what caused the instability seen validating this script under YelmoMirror (beta
+# collapsing to zero, thermal NaN by ~t=6.8yr, on the Greenland companion script). Fixed by
+# decoupling Shaktis own DT_YR/TIME_END_YR: ice flow evolves at the same cadence Shakti steps at
+# (dt_ice = dt_hydro), rather than holding ice fixed over a multi-year Shakti step or sub-cycling
+# Shakti under a fixed ice state -- both were options; this one doubles as a real test of the
+# coupling at Shaktis native timescale, at the cost of a much shorter total run than the K24/HAB
+# branches (a full 40yr run at 1-3 hours/step is 100k+ steps, impractical here).
+const DT_SHAKTI_HOURS     = get(ENV, "DT_SHAKTI_HOURS", "2.0")
+const DT_SHAKTI_YR        = parse(Float64, DT_SHAKTI_HOURS) / (24.0 * 365.25)
+const TIME_END_SHAKTI_DAYS = get(ENV, "TIME_END_SHAKTI_DAYS", "5.0")
+const TIME_END_SHAKTI_YR  = parse(Float64, TIME_END_SHAKTI_DAYS) / 365.25
+
 # Whether the Shakti coupling additionally tracks a dynamic frozen bed, and if so at what
 # threshold: `nothing` (default) disables it entirely -- Shakti's mask stays exactly as
 # build_hydrology_sim_Shakti's own one-time GROUNDED/OCEAN/LAND/OTHER_BASIN classification set it,
@@ -97,9 +111,12 @@ const FROZEN_BED_THRESHOLD = nothing # e.g. 0.0 to opt in
 # couple_step!, step!, run!) is reused unchanged across both backends -- they only touch
 # interior(...) fields, which both backends expose identically. What differs is model
 # construction (build_yelmo vs build_yelmo_mirror) and how the "N_eff is set externally" flag
-# is expressed: yneff.method = -1 in Julia's YelmoParameters vs. hyd.is_external = true in
-# Fortran's &yhyd (see yelmo/src/yelmo_dynamics.f90::calc_ydyn_neff's hyd%par%is_external
-# bypass, added specifically so an external host can push N_eff into YelmoMirror the same way).
+# is expressed: yneff.method = -1 in Julia's YelmoParameters (dyn.N_eff left alone) vs.
+# hyd.bkt_N_closure = -1 in Fortran's &yhyd (N_CLOSURE_EXTERNAL -- apply_N_closure leaves
+# hyd%now%N untouched) plus pushing N via the C API's hyd_N setter (yelmo_set_var2D,
+# case("hyd_N")): calc_ydyn_neff's dyn%now%N_eff = hyd%now%N fast path then
+# carries the pushed value through. Yelmo.jl's yelmo_sync! already pushes ylmo.dyn.N_eff under
+# both cnames, so writing yelmo.dyn.N_eff in *_to_Yelmo_*! below reaches Fortran either way.
 const BACKEND = lowercase(get(ENV, "FASTHYDRO_BACKEND", "yelmo"))
 BACKEND in ("yelmo", "mirror") ||
     error("FASTHYDRO_BACKEND must be 'yelmo' or 'mirror', got '$BACKEND'")
@@ -201,19 +218,19 @@ function build_yelmo(; external_neff::Bool)
 end
 
 """Mirror counterpart of `build_yelmo_parameters`. `external_neff = true` overrides
-`hyd.is_external` to `true` -- the &yhyd equivalent of the Julia backend's `yneff.method = -1`
+`hyd.bkt_N_closure` to `-1` -- the &yhyd equivalent of the Julia backend's `yneff.method = -1`
 (see `build_yelmo_parameters`'s docstring for the full rationale, and
 `yelmo/src/yelmo_dynamics.f90::calc_ydyn_neff` for the Fortran-side bypass this flag controls).
 Same contract as the Julia backend: only appropriate for a branch that will actually push
 N_eff every step. "No coupling" must pass `external_neff = false` and keep the shared nml's own
-&yhyd default (`is_external = false`), so `calc_ydyn_neff` keeps recomputing `dyn%now%N_eff`
+&yhyd default (`bkt_N_closure = 3`, till closure), so `calc_ydyn_neff` keeps recomputing `dyn%now%N_eff`
 from `hyd%now%N` (FastHydrology's till closure) every step -- nothing ever pushes N_eff for
 that branch, same reasoning as `yneff.method = 3` on the Julia side."""
 function build_yelmo_parameters_mirror(; external_neff::Bool)
     p = YelmoMirrorParameters(YELMO_NML_MIRROR, "Antarctica")
 
     if external_neff
-        hyd = _override_field(p.hyd, :is_external, true)
+        hyd = _override_field(p.hyd, :bkt_N_closure, -1)
         p   = _override_field(p, :hyd, hyd)
     end
 
@@ -570,7 +587,7 @@ function setup_yelmo(; external_neff::Bool)
     end
 
     if external_neff
-        # With N_eff set externally (yneff.method = -1 / hyd.is_external = true for
+        # With N_eff set externally (yneff.method = -1 / hyd.bkt_N_closure = -1 for
         # external_neff branches), calc_ydyn_neff! is a no-op, so without this N_eff would still
         # be sitting at its Field-allocation default (zero) for that first solve -- a
         # frictionless bed, which is what made the SSA solver diverge before this was added.
@@ -613,7 +630,7 @@ function main()
         yelmo -> NoCoupling(),
         yelmo -> CoupledHydrology(build_hydrology_sim_K24(yelmo)),
         yelmo -> CoupledHydrology(build_hydrology_sim_HAB(yelmo)),
-        yelmo -> CoupledHydrology(build_hydrology_sim_Shakti(yelmo, DT_YR); frozen_bed_threshold = FROZEN_BED_THRESHOLD),
+        yelmo -> CoupledHydrology(build_hydrology_sim_Shakti(yelmo, DT_SHAKTI_YR); frozen_bed_threshold = FROZEN_BED_THRESHOLD),
     ]
 
     # See BRANCH_SEL's definition above: unset runs all four branches in this one process
@@ -634,8 +651,12 @@ function main()
         # yelmo_out = init_output(yelmo, joinpath(yelmo.rundir, "yelmo.nc"); selection=OutputSelection(groups=yelmo_output_groups))
         # write_output!(yelmo_out, yelmo)
 
-        # Run the total time simulation
-        @time run!(coupling, yelmo; dt=DT_YR, time_end=TIME_END_YR)
+        # Run the total time simulation. Shakti runs at its own much shorter/finer
+        # dt/time_end (see DT_SHAKTI_YR/TIME_END_SHAKTI_YR above) -- everything else keeps
+        # the shared DT_YR/TIME_END_YR.
+        dt_this       = idx == 4 ? DT_SHAKTI_YR       : DT_YR
+        time_end_this = idx == 4 ? TIME_END_SHAKTI_YR : TIME_END_YR
+        @time run!(coupling, yelmo; dt=dt_this, time_end=time_end_this)
 
         # close(yelmo_out)
 

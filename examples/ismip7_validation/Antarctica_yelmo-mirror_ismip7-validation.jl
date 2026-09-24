@@ -30,20 +30,16 @@
 #      changed relative to what was read while writing this script.
 #
 # Known simplifications vs. the classic run (flagged, not silently dropped):
-#   - Isostasy: OFF here (Antarctica_mirror.nml, which this is based on, has
-#     no &isos section at all -- bed stays fixed). Not part of yelmo core at
-#     all -- the classic driver links Fortran FastIsostasy (LV-ELRA) as a
-#     separate yelmox-level library. Kryonomos.jl's own
-#     examples/fastisostasy/Greenland_yelmo-fastisostasy.jl already couples
-#     YelmoMirror to FastIsostasy.jl (the Julia port of the same algorithm,
-#     different implementation) -- adapting that pattern here is the next step.
-#   - Marine melt / PICO (bmb_method="quad-nl" in the classic run) is ALSO
-#     yelmox-level code (libs/marine_shelf.f90, libs/pico/), not reachable
-#     via the C API, and has no existing Julia port anywhere in this repo.
-#     `optimize_tf_corr!` IS driven below (writes to bnd.T_shlf, exactly what
-#     the classic driver's own tf_corr feeds into) but has NO physical effect
-#     on the ice yet, since yelmo core has no melt-from-T_shlf relationship
-#     without this piece -- the wiring is correct, the consumer isn't built.
+#   - Isostasy: wired via libyelmox_isos_c_api.so (fesmc/yelmox branch
+#     yelmox-c-api, libs/yelmox_isos_c_api.f90) -- the classic driver's own
+#     FastIsostasy coupling (method=2, interactive_sealevel, real ANT-32KM
+#     GIA rheology file), not a Julia reimplementation. Same rationale as
+#     marine-melt below: FastIsostasy.jl (Kryonomos.jl's own
+#     examples/fastisostasy/) is a DIFFERENT implementation of the same
+#     algorithm and would not reproduce the classic run bit-for-bit, so this
+#     wraps the real compiled physics instead.
+#   - Marine melt / PICO (bmb_method="quad-nl" in the classic run): wired via
+#     libyelmox_marshelf_c_api.so, same pattern -- see marshelf_wrapper.jl.
 #   - Reads the SAME height-dimension-fixed RACMO file the classic run uses
 #     (`~/yelmox/data_fixes/ANT-32KM_ERA5-3H_RACMO2.3p2_1979-2022_monthly_smb-fixed.nc`),
 #     not a locally-copied one -- keep that file where it is, or update
@@ -79,6 +75,12 @@ const MARSHELF_NML = joinpath(homedir(), "yelmox", "output", "ismip7_ant",
                                "spinup_ANT-32KM", "yelmox_esm_Antarctica_ismip7.nml")
 
 include("marshelf_wrapper.jl")
+include("isos_wrapper.jl")
+
+# &isos / &barysealevel params (method=2, interactive_sealevel, ANT-32KM GIA
+# rheology file) -- reuse the classic run's own already-resolved nml, same
+# rationale as MARSHELF_NML above.
+const ISOS_NML = MARSHELF_NML
 
 # Reference climatology window, matching the classic nml's &spinup.time_ref = 1985.0, 2014.0.
 # The fixed RACMO file's `time` axis is monthly, starting ~Jan 1979 (528 months total,
@@ -255,6 +257,19 @@ function step_with_optimizer!(y, dt, tf_corr::AbstractMatrix)
     marshelf_get_var2D!(bmb_shlf, "bmb_shlf")
     interior(y.bnd.bmb_shlf)[:, :, 1] .= bmb_shlf
 
+    # Isostasy: step libyelmox_isos_c_api.so forward with the post-step H_ice,
+    # pull the resulting bedrock/sea-surface fields back out, and write them
+    # into bnd.z_bed/bnd.z_sl -- picked up by step! on the NEXT iteration,
+    # exactly matching couple_isostasy_to_yelmo's landing point in the classic
+    # driver (called before yelmo_update, i.e. before the next step).
+    isos_update!(H_ice, y.time)
+    z_bed_new = similar(H_ice)
+    z_ss_new  = similar(H_ice)
+    isos_get_var2D!(z_bed_new, "z_bed")
+    isos_get_var2D!(z_ss_new,  "z_ss")
+    interior(y.bnd.z_bed)[:, :, 1] .= z_bed_new
+    interior(y.bnd.z_sl)[:, :, 1]  .= z_ss_new
+
     return y
 end
 
@@ -303,6 +318,20 @@ function main()
     basins  = interior(y.bnd.basins)[:, :, 1]
     marshelf_init!(MARSHELF_NML, "marine_shelf", nx, ny, "Antarctica", "ANT-32KM",
                    regions, basins, axis_centered(nx, dx), axis_centered(ny, dx), dx)
+
+    # Isostasy reference + initial state, mirroring yelmox_domain.f90's
+    # domain_init_state: isos_init_ref (bed/thickness reference for the
+    # elastic/viscous anomaly), THEN isos_init_state (current state at t=0).
+    # z_bed_ref/H_ice_ref are real yelmo bnd fields (already exposed via the
+    # C API as bnd_z_bed_ref/bnd_H_ice_ref, same generic getter H_ice_ref
+    # already uses above for the cb_ref optimizer's H_obs).
+    z_bed_ref = interior(y.bnd.z_bed_ref)[:, :, 1]
+    H_ice_ref = interior(y.bnd.H_ice_ref)[:, :, 1]
+    z_bed0    = interior(y.bnd.z_bed)[:, :, 1]
+    H_ice0    = interior(y.tpo.H_ice)[:, :, 1]
+    isos_init!(ISOS_NML, "isos", nx, ny, dx, dx, 0.0)
+    isos_init_ref!(z_bed_ref, H_ice_ref)
+    isos_init_state!(z_bed0, H_ice0, 0.0)
 
     d0 = domain_diagnostics(y)
     @info "t=0" V_ice_km3=d0.V_ice H_max_m=d0.H_max

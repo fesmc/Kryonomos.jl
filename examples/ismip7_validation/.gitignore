@@ -1,0 +1,4 @@
+*.out
+*.err
+*.nml
+!Antarctica_ismip7_mirror.nml

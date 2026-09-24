@@ -9,8 +9,17 @@
 # trustworthy BEFORE any K24/Shakti hydrology gets layered on top (see
 # `examples/fasthydrology/` for that, once this passes).
 #
-# STATUS: first draft, not yet executed. Two things specifically need
-# verifying on a real run (marked VERIFY below):
+# STATUS (2026-09-24): runs end-to-end (real ANT-32KM grid, confirmed via
+# YelmoMirrorParameters(filename, "Antarctica") -- the one-arg string
+# YelmoMirror(filename, ...) constructor does NOT read the nml's domain/grid,
+# it silently defaults to Greenland; this cost real debugging time). First
+# comparison against the classic 200-yr reference showed a LARGE mismatch
+# (Mirror H_ice mean 725.6 m vs. reference 1.0 m -- the classic run's own
+# spin-up is deep into a collapse by t=200, see project memory), not
+# numerical noise -- don't treat this script as validated until that's
+# understood and a re-run comparison is closer.
+#
+# Two things still need verifying on a real run (marked VERIFY below):
 #   1. Whether writing `interior(y.dyn.cb_ref) .= ...` on the Julia side and
 #      then calling `step!` actually pushes it into Fortran before the step
 #      (matching how `hyd_N` external-N coupling pushes via `yelmo_sync!`),
@@ -22,12 +31,19 @@
 #
 # Known simplifications vs. the classic run (flagged, not silently dropped):
 #   - Isostasy: OFF here (Antarctica_mirror.nml, which this is based on, has
-#     no &isos section at all -- bed stays fixed). The classic run uses
-#     LV-ELRA. Over 200 yr this is a second-order difference next to the
-#     friction-optimization signal being tested, but matters for a longer run.
-#   - tf_corr (thermal-forcing / ocean-melt optimization) is NOT driven here
-#     yet -- only cb_ref. Add `Yelmo.optimize_tf_corr!` once cb_ref parity
-#     is confirmed (see project_yelmo_hydro_optimizer.md memory).
+#     no &isos section at all -- bed stays fixed). Not part of yelmo core at
+#     all -- the classic driver links Fortran FastIsostasy (LV-ELRA) as a
+#     separate yelmox-level library. Kryonomos.jl's own
+#     examples/fastisostasy/Greenland_yelmo-fastisostasy.jl already couples
+#     YelmoMirror to FastIsostasy.jl (the Julia port of the same algorithm,
+#     different implementation) -- adapting that pattern here is the next step.
+#   - Marine melt / PICO (bmb_method="quad-nl" in the classic run) is ALSO
+#     yelmox-level code (libs/marine_shelf.f90, libs/pico/), not reachable
+#     via the C API, and has no existing Julia port anywhere in this repo.
+#     `optimize_tf_corr!` IS driven below (writes to bnd.T_shlf, exactly what
+#     the classic driver's own tf_corr feeds into) but has NO physical effect
+#     on the ice yet, since yelmo core has no melt-from-T_shlf relationship
+#     without this piece -- the wiring is correct, the consumer isn't built.
 #   - Reads the SAME height-dimension-fixed RACMO file the classic run uses
 #     (`~/yelmox/data_fixes/ANT-32KM_ERA5-3H_RACMO2.3p2_1979-2022_monthly_smb-fixed.nc`),
 #     not a locally-copied one -- keep that file where it is, or update
@@ -40,7 +56,7 @@ import Pkg; Pkg.activate(".")
 
 using Yelmo
 using Yelmo: YelmoMirror
-using Yelmo.YelmoMirrorPar: YelmoParameters
+
 using NCDatasets
 using Statistics
 using Printf
@@ -55,6 +71,14 @@ const CLIMATE_FILE  = joinpath(homedir(), "yelmox", "data_fixes",
 # invocation, ANT-32KM, 200 yr, full colleague override set):
 const REFERENCE_RESTART = joinpath(homedir(), "yelmox", "output", "ismip7_ant",
                                     "spinup_ANT-32KM", "restart-0.200-kyr", "yelmo_restart.nc")
+
+# &marine_shelf params (bmb_method="quad-nl", gamma_quad_nl, etc.) -- reuse the classic
+# run's own already-resolved nml rather than duplicating those values here; marshelf_init
+# just needs a file with a &marine_shelf group in it, doesn't have to be the Mirror nml.
+const MARSHELF_NML = joinpath(homedir(), "yelmox", "output", "ismip7_ant",
+                               "spinup_ANT-32KM", "yelmox_esm_Antarctica_ismip7.nml")
+
+include("marshelf_wrapper.jl")
 
 # Reference climatology window, matching the classic nml's &spinup.time_ref = 1985.0, 2014.0.
 # The fixed RACMO file's `time` axis is monthly, starting ~Jan 1979 (528 months total,
@@ -75,6 +99,13 @@ const OPT_CF_MIN     = 1e-4
 const OPT_CF_MAX     = 1e0     # no explicit upper bound in the classic config; 1.0 is
                                  # effectively unconstrained for a friction coefficient here
 const OPT_FILL_METHOD = "cf_min"
+
+# tf_corr params, from the same validated runme override set (see project memory).
+const OPT_TAU_M      = 10.0
+const OPT_M_TEMP     = 10.0
+const OPT_TF_MIN     = -1.0
+const OPT_TF_MAX     = 1.0
+const OPT_H_GRND_LIM = 500.0
 
 # ── Southern-Hemisphere lapse rate (esm_clim_update, yelmox libs/esm_forcing.f90) ──
 # lapse = lapse[1] + (lapse[2]-lapse[1]) * cos(2*pi*(month*30.4375 - 30.4375)/365.25)
@@ -105,7 +136,7 @@ function load_ismip7_reference_climatology(z_srf_model::AbstractMatrix)
     NCDataset(CLIMATE_FILE) do ds
         t2m_all = ds["t2m"][:, :, (REF_TIME_START_IDX+1):(REF_TIME_END_IDX+1)]      # K
         smb_all = ds["smb"][:, :, (REF_TIME_START_IDX+1):(REF_TIME_END_IDX+1)]      # kg m^-2 month^-1
-        zs_ref  .= ds["z_srf"][:, :]                                                # m, time-independent
+        zs_ref  .= Array{Float64}(coalesce.(ds["z_srf"][:, :], 0.0))                    # m, time-independent
 
         n_months = size(t2m_all, 3)
         for m in 1:12
@@ -134,16 +165,38 @@ function load_ismip7_reference_climatology(z_srf_model::AbstractMatrix)
     return T_srf_ann, smb_ann
 end
 
+const OBS_FILE = joinpath(homedir(), "yelmox", "ice_data", "ISMIP7", "Antarctica", "ANT-32KM",
+                          "obs", "ANT-32KM_ObsISMIP7-v1.1.nc")
+
+"""
+Real geothermal heat flux, matching the classic run's `ghf.obs_name =
+geothermal_heat_flux1,geothermal_heat_flux2` (Staal et al. 2021 / a second product) --
+averages the two products where both are valid, falls back to whichever one is valid
+where only one is, matching the usual multi-product-blend convention for this field.
+Both carry `_FillValue = -9e33`; anything that negative is treated as missing.
+"""
+function load_ghf()
+    NCDataset(OBS_FILE) do ds
+        g1 = Array{Float64}(replace(ds["geothermal_heat_flux1"][:, :], missing => NaN))
+        g2 = Array{Float64}(replace(ds["geothermal_heat_flux2"][:, :], missing => NaN))
+        valid1 = g1 .> -1.0e10
+        valid2 = g2 .> -1.0e10
+        ghf = zeros(size(g1))
+        @. ghf = ifelse(valid1 & valid2, (g1 + g2) / 2,
+                  ifelse(valid1, g1,
+                  ifelse(valid2, g2, 55.0)))   # both missing -> same fallback constant as before
+        return ghf
+    end
+end
+
 function apply_forcing_mirror!(y)
     z_srf = interior(y.tpo.z_srf)[:, :, 1]
     T_srf, smb = load_ismip7_reference_climatology(z_srf)
 
     interior(y.bnd.T_srf)[:, :, 1]    .= T_srf
     interior(y.bnd.smb_ref)[:, :, 1]  .= smb
+    interior(y.bnd.Q_geo)[:, :, 1]    .= load_ghf()
 
-    fill!(interior(y.bnd.Q_geo), 55.0)   # no per-cell GHF wired here yet; ISMIP7 obs file
-                                          # has geothermal_heat_flux1/2 -- TODO: read those
-                                          # instead, like the classic run's ghf.obs_name does.
     fill!(interior(y.bnd.z_sl), 0.0)
 
     return y
@@ -157,7 +210,7 @@ ice_optimization.f90 -- see fesmc/Yelmo.jl PR #88 / project memory). Mirrors
 how the classic driver only ever calls this from outside yelmo_update, once
 per outer timestep -- not part of Yelmo.jl's own step! phase order.
 """
-function step_with_optimizer!(y, dt)
+function step_with_optimizer!(y, dt, tf_corr::AbstractMatrix)
     step!(y, dt)   # VERIFY: confirm this both pushes any Julia-side cb_ref edits from
                     # the PREVIOUS iteration into Fortran before stepping, and pulls the
                     # post-step H_ice/dHidt/ux_bar/uy_bar back out afterward -- if not
@@ -170,6 +223,7 @@ function step_with_optimizer!(y, dt)
     H_obs      = interior(y.bnd.H_ice_ref)[:, :, 1]   # dta%pd%H_ice, copied to bnd%H_ice_ref at init
     uxy_obs    = interior(y.dta.pd_uxy_s)[:, :, 1]     # needs fesmc/yelmo PR #8's dta_pd_uxy_s getter
     H_grnd_obs = interior(y.dta.pd_H_grnd)[:, :, 1]    # needs fesmc/yelmo PR #8's dta_pd_H_grnd getter
+    H_grnd     = interior(y.tpo.H_grnd)[:, :, 1]       # model-side (not obs) grounding state, for tf_corr
     cb_ref  = interior(y.dyn.cb_ref)[:, :, 1]
 
     optimize_cb_ref!(cb_ref, H_ice, dHdt, ux_bar, uy_bar, H_obs, uxy_obs, H_grnd_obs,
@@ -178,6 +232,28 @@ function step_with_optimizer!(y, dt)
 
     interior(y.dyn.cb_ref)[:, :, 1] .= cb_ref   # write back; picked up by step! next iteration
                                                   # per the VERIFY note above
+
+    # tf_corr now has a real consumer: libyelmox_marshelf_c_api.so wraps the classic
+    # driver's own marine_shelf.f90 (fesmc/yelmox branch yelmox-c-api). Push tf_corr into
+    # it, call the real compiled marshelf_update, pull the resulting bmb_shlf back out --
+    # same physics the classic run uses, not a Julia reimplementation.
+    optimize_tf_corr!(tf_corr, H_ice, H_grnd, dHdt, H_obs, OPT_H_GRND_LIM, y.g.Δxᶜᵃᵃ,
+                       OPT_TAU_M, OPT_M_TEMP, OPT_TF_MIN, OPT_TF_MAX, dt)
+    interior(y.bnd.T_shlf)[:, :, 1] .= tf_corr
+
+    z_bed   = interior(y.bnd.z_bed)[:, :, 1]
+    f_grnd  = interior(y.tpo.f_grnd)[:, :, 1]
+    regions = interior(y.bnd.regions)[:, :, 1]
+    basins  = interior(y.bnd.basins)[:, :, 1]
+    z_sl    = interior(y.bnd.z_sl)[:, :, 1]
+    dx      = abs(Float64(y.g.Δxᶜᵃᵃ))
+
+    marshelf_set_var2D!(tf_corr, "tf_corr")
+    marshelf_update!(H_ice, z_bed, f_grnd, regions, basins, z_sl, dx)
+
+    bmb_shlf = similar(H_ice)
+    marshelf_get_var2D!(bmb_shlf, "bmb_shlf")
+    interior(y.bnd.bmb_shlf)[:, :, 1] .= bmb_shlf
 
     return y
 end
@@ -215,19 +291,28 @@ end
 # ── Run ────────────────────────────────────────────────────────────────────────
 function main()
     @info "Building Antarctica YelmoMirror (ISMIP7 validation, no hydrology)..."
-    p = YelmoParameters(YELMO_NML_MIRROR, "Antarctica")
+    p = Yelmo.YelmoMirrorPar.YelmoMirrorParameters(YELMO_NML_MIRROR, "Antarctica")
     y = YelmoMirror(p, 0.0; alias="ismip7_ant_mirror", rundir=RUN_DIR, overwrite=true)
 
     apply_forcing_mirror!(y)
     init_state!(y, 0.0; thrm_method="robin-cold")
 
+    nx, ny = size(interior(y.tpo.H_ice))[1:2]
+    dx     = abs(Float64(y.g.Δxᶜᵃᵃ))
+    regions = interior(y.bnd.regions)[:, :, 1]
+    basins  = interior(y.bnd.basins)[:, :, 1]
+    marshelf_init!(MARSHELF_NML, "marine_shelf", nx, ny, "Antarctica", "ANT-32KM",
+                   regions, basins, axis_centered(nx, dx), axis_centered(ny, dx), dx)
+
     d0 = domain_diagnostics(y)
     @info "t=0" V_ice_km3=d0.V_ice H_max_m=d0.H_max
+
+    tf_corr = zeros(size(interior(y.tpo.H_ice))[1:2])   # caller-owned across iterations
 
     n_steps = round(Int, T_END_YR / DT_OUTER_YR)
     @printf("  %6s  %12s  %10s  %8s\n", "t[yr]", "V_ice[km³]", "H_max[m]", "step[s]")
     for k in 1:n_steps
-        t_step = @elapsed step_with_optimizer!(y, DT_OUTER_YR)
+        t_step = @elapsed step_with_optimizer!(y, DT_OUTER_YR, tf_corr)
         d = domain_diagnostics(y)
         @printf("  %6.0f  %12.4e  %10.1f  %8.2f\n", y.time, d.V_ice, d.H_max, t_step)
         flush(stdout)

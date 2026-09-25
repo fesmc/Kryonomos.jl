@@ -75,14 +75,17 @@ const TIME_END_SHAKTI_YR  = parse(Float64, TIME_END_SHAKTI_DAYS) / 365.25
 # Whether the Shakti coupling additionally tracks a dynamic frozen bed, and if so at what
 # threshold: `nothing` (default) disables it entirely -- Shakti's mask stays exactly as
 # build_hydrology_sim_Shakti's own one-time GROUNDED/OCEAN/LAND/OTHER_BASIN classification set it,
-# matching every existing run exactly. A `Float64` enables it: every couple_step! reclassifies
-# grounded cells between GROUNDED and FROZEN_BED from Yelmo's live f_pmp (`yelmo.thrm.f_pmp`,
-# fraction of a cell at the pressure-melting point -- 0 fully frozen, 1 fully temperate) via
-# `update_frozen_bed!` below, freezing a cell once `f_pmp <= threshold` and thawing it once
-# `f_pmp > threshold`. No hysteresis band -- a cell sitting exactly at the threshold could flip
-# every step; tighten this into a two-threshold band if that ever shows up as chatter in practice.
+# matching every existing run exactly. A `Float64` enables it and is Shakti's `T_freeze` (K): every
+# couple_step! reclassifies grounded cells between GROUNDED and FROZEN_BED from Yelmo's live basal
+# temperature relative to pressure melting (`yelmo.thrm.T_prime_b`, K) via `update_frozen_bed!`
+# below -- a GROUNDED cell freezes once `T_prime_b < FROZEN_BED_THRESHOLD`, a FROZEN_BED cell thaws
+# once `T_prime_b >= FROZEN_BED_THRESHOLD + FROZEN_BED_HYSTERESIS`, and in between it keeps its
+# state (the hysteresis band stops a cell sitting at the threshold from flipping every step).
+# Both values are handed to Shakti's ModelParameters (`T_freeze`/`T_hysteresis`) in
+# build_hydrology_sim_Shakti; the freezing itself is `Shakti.update_frozen_mask!`.
 # K24/HAB have no FROZEN_BED concept, so this is ignored on those branches even if set.
-const FROZEN_BED_THRESHOLD = nothing # e.g. 0.0 to opt in
+const FROZEN_BED_THRESHOLD  = nothing # K of T_prime_b, e.g. -1.0 (Yelmo's own bmb cutoff) to opt in
+const FROZEN_BED_HYSTERESIS = 0.5     # K; thaw threshold = FROZEN_BED_THRESHOLD + this (0 => no hysteresis)
 
 # ── Backend selection ────────────────────────────────────────────────────────
 # "yelmo" (default) — pure-Julia YelmoModel, as this script has always run.
@@ -238,7 +241,7 @@ simulation type (`SteadyStateSimulation{KazmierczakHydroModel}`, `SteadyStateSim
 or `TimeSimulation{ShaktiHydroModel}`) `build_hydrology_sim_*` below produced -- `couple_step!`
 dispatches on `sim.model`'s type to run the right coupling for whichever one is active.
 
-`frozen_bed_threshold`: see [`FROZEN_BED_THRESHOLD`](@ref)'s own definition above -- forwarded to
+`frozen_bed_threshold`: see [`FROZEN_BED_THRESHOLD`](@ref)'s own definition above (a `T_prime_b` threshold in K, or `nothing`) -- forwarded to
 `couple_step!` every step (only the Shakti method does anything with it)."""
 struct CoupledHydrology{S, FB} <: HydrologyCoupling
     sim::S
@@ -403,7 +406,9 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
     gap0   = fill(1e-3, Nx, Ny)   # initial gap height guess; no Yelmo equivalent
     ieb    = zeros(Nx, Ny)        # no explicit moulin coupling (see docstring above)
 
-    p  = Shakti.ModelParameters(rho_i = RHO_I)
+    p  = Shakti.ModelParameters(rho_i = RHO_I,
+                                T_freeze = FROZEN_BED_THRESHOLD === nothing ? -1.0 : FROZEN_BED_THRESHOLD, # only used when the frozen bed is on, see FROZEN_BED_THRESHOLD
+                                T_hysteresis = FROZEN_BED_HYSTERESIS)
     mi = Shakti.ConstantMeltInput()
     sl = Shakti.PrescribedSlidingLaw()   # taub is supplied directly from Yelmo's own dynamics solve, not solved by Shakti
 
@@ -453,24 +458,19 @@ function Yelmo_to_FastHydrology_Shakti!(shakti_sim, yelmo)
 end
 
 """Reclassifies grounded cells between GROUNDED and FROZEN_BED each coupling step, driven by
-Yelmo's live `f_pmp` (fraction of a cell at the pressure-melting point -- `yelmo.thrm.f_pmp`, 0
-fully frozen, 1 fully temperate; see [`FROZEN_BED_THRESHOLD`](@ref)'s own definition). A
-currently-GROUNDED cell freezes once `f_pmp <= threshold`; a currently-FROZEN_BED cell thaws once
-`f_pmp > threshold` -- no hysteresis band, see FROZEN_BED_THRESHOLD's own caveat on that. Only
-called when `threshold !== nothing` (see `couple_step!(::ShaktiHydroModel, ...)` below).
+Yelmo's live basal temperature relative to pressure melting (`yelmo.thrm.T_prime_b`, K). Only
+called when `frozen_bed_threshold !== nothing` (see `couple_step!(::ShaktiHydroModel, ...)` below).
 
-Delegates the actual mask/state bookkeeping to `Shakti.freeze_cells!`/`Shakti.thaw_cells!`
-(`frozen_bed.jl`), which are otherwise "not yet wired to any automatic driver" per their own
-docstring -- this is that driver, for the Shakti coupling specifically. Both calls are safe to run
-unconditionally against the same `is_frozen`/`.!is_frozen` pair: `freeze_cells!` only touches
-cells currently GROUNDED and `thaw_cells!` only touches cells currently FROZEN_BED, so neither
-disturbs an OCEAN/LAND/OTHER_BASIN cell even though `is_frozen` also covers those."""
-function update_frozen_bed!(shakti_sim, yelmo, threshold)
-    f_pmp = interior(yelmo.thrm.f_pmp, :, :, 1)
-    is_frozen = f_pmp .<= threshold
-    Shakti.freeze_cells!(shakti_sim.state, shakti_sim.p, is_frozen)
-    Shakti.thaw_cells!(shakti_sim.state, shakti_sim.p, .!is_frozen)
-    return nothing
+The criterion lives in Shakti, not here: `Shakti.update_frozen_mask!` freezes a GROUNDED cell with
+`T_prime_b < p.T_freeze` and thaws a FROZEN_BED cell with `T_prime_b >= p.T_freeze + p.T_hysteresis`
+(both set on `shakti_sim.p` in build_hydrology_sim_Shakti from [`FROZEN_BED_THRESHOLD`](@ref) /
+[`FROZEN_BED_HYSTERESIS`](@ref)), leaving OCEAN/LAND/OTHER_BASIN cells alone. Freezing is a cutoff:
+water still held in a freezing cell is discarded (Shakti's `q_T` term is what gradually refreezes
+it beforehand), see `Shakti.freeze_cells!`'s docstring. Returns Shakti's `(n_frozen, n_thawed,
+discarded_b)` summary."""
+function update_frozen_bed!(shakti_sim, yelmo)
+    T_prime_b = interior(yelmo.thrm.T_prime_b, :, :, 1)
+    return Shakti.update_frozen_mask!(shakti_sim.state, shakti_sim.p, T_prime_b)
 end
 
 """Copy Shakti's effective pressure / gap height back into Yelmo boundary fields. Shakti's state
@@ -511,7 +511,7 @@ function couple_step!(model::ShaktiHydroModel, sim, yelmo, dt; frozen_bed_thresh
         "shakti_sim.dt[] = $(shakti_sim.dt[]) s -- rebuild the Shakti sim with the dt actually used by run!.")
 
     Yelmo_to_FastHydrology_Shakti!(shakti_sim, yelmo)
-    frozen_bed_threshold !== nothing && update_frozen_bed!(shakti_sim, yelmo, frozen_bed_threshold)
+    frozen_bed_threshold !== nothing && update_frozen_bed!(shakti_sim, yelmo)
     FastHydrology.step!(sim)   # one Shakti step == one Yelmo step (dt matched, see above)
     FastHydrology_to_Yelmo_Shakti!(yelmo, shakti_sim)
 end

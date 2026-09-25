@@ -435,6 +435,11 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
     p  = Shakti.ModelParameters(rho_i = RHO_I,
                                 T_freeze = FROZEN_BED_THRESHOLD === nothing ? -1.0 : FROZEN_BED_THRESHOLD, # only used when the frozen bed is on, see FROZEN_BED_THRESHOLD
                                 T_hysteresis = FROZEN_BED_HYSTERESIS)
+    # TODO/REMINDER (frozen bed): thawing regions needs b_min > 0. ModelParameters' default b_min = 0 reseeds thawed cells at
+    # b = 0; on real data (pan-Antarctica 32km, whole cold bed thawed at once) that diverged to NaN, whereas b_min = 1e-6
+    # (and 1e-4, 1e-3) converged fine. Under CUDSS it fails silently. Set b_min here (e.g. 1e-6) before relying on FROZEN_BED_THRESHOLD.
+    FROZEN_BED_THRESHOLD !== nothing && p.b_min <= 0 &&
+        @warn "FROZEN_BED_THRESHOLD is set but Shakti's b_min = $(p.b_min) (<= 0): thawing frozen-bed cells will reseed them at b = 0 and can diverge (NaN Picard). Set b_min > 0, e.g. 1e-6. See TODO in build_hydrology_sim_Shakti."
     mi = Shakti.ConstantMeltInput()
     sl = Shakti.PrescribedSlidingLaw()   # taub is supplied directly from Yelmo's own dynamics solve, not solved by Shakti
 

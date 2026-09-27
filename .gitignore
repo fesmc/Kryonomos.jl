@@ -55,3 +55,4 @@ examples/archive/
 
 # Symlinks into a separate Fortran yelmo checkout on this machine, not repo content
 examples/input/
+examples/ismip7_validation/

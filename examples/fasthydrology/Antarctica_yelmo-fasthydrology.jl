@@ -255,8 +255,10 @@ function build_yelmo_parameters_mirror(; external_neff::Bool)
     if external_neff
         hyd = _override_field(p.hyd, :bkt_N_closure, -1)
         p   = _override_field(p, :hyd, hyd)
-        # the external hydrology also supplies the freeze-on capacity (see _push_exchange!)
+        # the external hydrology also supplies the freeze-on capacity (see _push_exchange!); the
+        # capacity basal BC exists only in the enthalpy solver
         ytherm = _override_field(p.ytherm, :cap_source, "hyd")
+        ytherm = _override_field(ytherm, :method, "enth")
         p      = _override_field(p, :ytherm, ytherm)
     end
 
@@ -541,7 +543,10 @@ function FastHydrology_to_Yelmo_Shakti!(yelmo, shakti_sim)
     interior(yelmo.dyn.N_eff, :, :, 1) .= shakti_sim.state.N
     interior(yelmo.thrm.H_w,  :, :, 1) .= shakti_sim.state.b   # gap height stands in for water-layer thickness
     # capacity for the next gap update, from this step's b, N and |u_b| (Shakti.freeze_on_capacity!)
-    C_frz = Shakti.freeze_on_capacity!(zeros(size(shakti_sim.state.b)), shakti_sim)
+    # The gap room is a stock available once per Yelmo step, and Yelmo advances in chunks of at
+    # least dt_min while Shakti subcycles in hours, so it is spread over the Yelmo step.
+    dt_host = max(shakti_sim.dt[], yelmo.p.yelmo.dt_min * FastHydrology.SECONDS_PER_YEAR)
+    C_frz = Shakti.freeze_on_capacity!(zeros(size(shakti_sim.state.b)), shakti_sim; dt = dt_host)
     _push_exchange!(yelmo; C_frz = C_frz, Q_diss = Array(shakti_sim.state.Q_diss), Q_sens = Array(shakti_sim.state.Q_sens))
 end
 
@@ -716,4 +721,5 @@ function main()
 
 end
 
-main()
+# KRYO_NO_MAIN=1 lets another script include this file for its setup functions without running the smoke test.
+get(ENV, "KRYO_NO_MAIN", "") == "" && main()

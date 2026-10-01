@@ -349,7 +349,7 @@ end
 function FastHydrology_to_Yelmo_K24!(yelmo, sim)
     yelmo.dyn.N_eff .= sim.state.N   # effective pressure
     yelmo.thrm.H_w  .= sim.state.W   # subglacial water thickness
-    C_frz = freeze_on_capacity!(zeros(size(interior(yelmo.dyn.N_eff, :, :, 1))), sim.model, sim.grid, sim.state)
+    C_frz = FastHydrology.freeze_on_capacity!(zeros(size(interior(yelmo.dyn.N_eff, :, :, 1))), sim.model, sim.grid, sim.state)
     _push_exchange!(yelmo; C_frz = C_frz, Q_diss = Array(interior(sim.model.Q_diss, :, :, 1)))
 end
 

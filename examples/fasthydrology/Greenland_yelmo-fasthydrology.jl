@@ -45,6 +45,26 @@ const YELMO_TOPO_FILE    = joinpath(DATA_DIR, "GRL-16KM_TOPO-M17-v5.nc")
 # perYear2perSecond. rho_i must match KazmierczakHydroModel's/Shakti's own rho_i default, since
 # it's used to convert Yelmo's ice-equivalent bmb_grnd into a mass melt rate for K24.
 const RHO_I = 917.0
+const RHO_W = 1000.0
+
+# ── Basal source terms and the hydrology -> thermodynamics exchange ──────────
+# K24 and Shakti build their water source from the terms of the basal melt rate: geothermal heat G,
+# heat conducted into the ice q_T (Yelmo's Q_ice_b) and the frictional / dissipation heat they
+# compute themselves, plus water reaching the bed from above, i_eb (Yelmo's melt_int, the englacial
+# water drained to the bed). In return they hand Yelmo's capacity basal boundary condition the
+# freeze-on capacity C_frz and the water-side heat Q_diss (+ Q_sens), pushed into hyd%now with
+# ytherm.cap_source = "hyd" (Mirror backend only; the Julia backend has no capacity rule yet).
+
+"""Heat conducted from the bed into the ice [W/m^2] (Yelmo's Q_ice_b, mW/m^2)."""
+_q_T(yelmo) = interior(yelmo.thrm.Q_ice_b, :, :, 1) .* 1e-3
+
+"""Englacial water drained to the bed [m/yr ice equivalent] (Yelmo's melt_int; zero where the
+backend does not provide it)."""
+_melt_int(yelmo) = hasproperty(yelmo.thrm, :melt_int) ? interior(yelmo.thrm.melt_int, :, :, 1) :
+                   zeros(size(interior(yelmo.thrm.Q_ice_b, :, :, 1)))
+
+"""Push the hydrology's capacity and water-side heat into Yelmo (SI units); Mirror backend only."""
+_push_exchange!(yelmo; kwargs...) = BACKEND == "mirror" ? Yelmo.yelmo_set_hydrology_exchange!(yelmo; kwargs...) : nothing
 
 # Outer (Yelmo) timestep and total run length, shared by every coupling branch. K24/HAB are
 # steady-state (no internal dt of their own -- they just re-solve from whatever Yelmo state is
@@ -209,6 +229,9 @@ function build_yelmo_parameters_mirror(; external_neff::Bool)
     if external_neff
         hyd = _override_field(p.hyd, :bkt_N_closure, -1)
         p   = _override_field(p, :hyd, hyd)
+        # the external hydrology also supplies the freeze-on capacity (see _push_exchange!)
+        ytherm = _override_field(p.ytherm, :cap_source, "hyd")
+        p      = _override_field(p, :ytherm, ytherm)
     end
 
     return p
@@ -268,16 +291,18 @@ function build_hydrology_sim_K24(yelmo)
     b       = interior(yelmo.bnd.z_bed,  :, :, 1)   # bedrock elevation
     abs_v_b = perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1))              # basal speed
     A_visc  = perYear2perSecond.(mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1])  # depth-averaged rate factor
-    # bmb_grnd is ice-equivalent [m/yr], positive = accretion, negative = melt; mdot wants a
-    # positive mass melt rate [kg/m^2/s], hence the sign flip and the rho_i scaling.
-    mdot    = perYear2perSecond.(-interior(yelmo.thrm.bmb_grnd, :, :, 1) .* RHO_I)
+    # Water source from terms [W/m^2] and water from above [kg/m^2/s] (see _q_T/_melt_int).
+    G       = interior(yelmo.bnd.Q_geo, :, :, 1) .* 1e-3
+    q_T     = _q_T(yelmo)
+    i_eb    = perYear2perSecond.(_melt_int(yelmo) .* RHO_I)
     kappa   = zeros(T, Nx, Ny)   # bed hardness (0: hard, 1: soft)
 
-    longcoupwater = 0.0   # smoothing of geometric-potential gradients
+    coupling_length_kamb86 = 0.0   # stress-gradient coupling length [ice thicknesses]; 0 disables the smoothing
     fill_iters    = 10    # iterations to fill local minima in potential field
 
     grid  = OGRectHydroGrid(Nx, Ny, xlims, ylims; T = T)
-    model = KazmierczakHydroModel(grid, kappa, abs_v_b, A_visc, mdot; longcoupwater=longcoupwater, fill_iters=fill_iters)
+    model = KazmierczakHydroModel(grid, kappa, abs_v_b, A_visc, G, q_T; i_eb = i_eb,
+                                  coupling_length_kamb86 = coupling_length_kamb86, fill_iters = fill_iters)
     state = HydroState(grid, mask, h, b)
     return SteadyStateSimulation(model, grid, state)
 end
@@ -289,7 +314,8 @@ function Yelmo_to_FastHydrology_K24!(sim, yelmo)
     sim.state.b       .= interior(yelmo.bnd.z_bed, :, :, 1)
     sim.model.abs_v_b .= perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1))
     sim.model.A_visc  .= perYear2perSecond.(mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1])
-    sim.model.mdot    .= perYear2perSecond.(-interior(yelmo.thrm.bmb_grnd, :, :, 1) .* RHO_I)
+    set_basal_terms!(sim.model; G = interior(yelmo.bnd.Q_geo, :, :, 1) .* 1e-3, q_T = _q_T(yelmo),
+                     i_eb = perYear2perSecond.(_melt_int(yelmo) .* RHO_I))
     fill!(sim.model.kappa, 0)
 end
 
@@ -297,6 +323,8 @@ end
 function FastHydrology_to_Yelmo_K24!(yelmo, sim)
     yelmo.dyn.N_eff .= sim.state.N   # effective pressure
     yelmo.thrm.H_w  .= sim.state.W   # subglacial water thickness
+    C_frz = freeze_on_capacity!(zeros(size(interior(yelmo.dyn.N_eff, :, :, 1))), sim.model, sim.grid, sim.state)
+    _push_exchange!(yelmo; C_frz = C_frz, Q_diss = Array(interior(sim.model.Q_diss, :, :, 1)))
 end
 
 # ── HAB (height above buoyancy): build + coupling functions ───────────────────
@@ -404,7 +432,7 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
     taub_y = interior(yelmo.dyn.taub_acy, :, :, 1)
     G      = interior(yelmo.bnd.Q_geo, :, :, 1) .* 1e-3   # mW/m^2 -> W/m^2
     gap0   = fill(1e-3, Nx, Ny)   # initial gap height guess; no Yelmo equivalent
-    ieb    = zeros(Nx, Ny)        # no explicit moulin coupling (see docstring above)
+    ieb    = perYear2perSecond.(_melt_int(yelmo) .* (RHO_I / RHO_W))   # englacial water drained to the bed [m/s water]
 
     p  = Shakti.ModelParameters(rho_i = RHO_I,
                                 T_freeze = FROZEN_BED_THRESHOLD === nothing ? -1.0 : FROZEN_BED_THRESHOLD, # only used when the frozen bed is on, see FROZEN_BED_THRESHOLD
@@ -455,6 +483,8 @@ function Yelmo_to_FastHydrology_Shakti!(shakti_sim, yelmo)
     s.taub_x .= interior(yelmo.dyn.taub_acx, :, :, 1)
     s.taub_y .= interior(yelmo.dyn.taub_acy, :, :, 1)
     s.G      .= interior(yelmo.bnd.Q_geo, :, :, 1) .* 1e-3
+    s.q_T    .= _q_T(yelmo)
+    s.ieb    .= perYear2perSecond.(_melt_int(yelmo) .* (RHO_I / RHO_W))   # read as-is by ConstantMeltInput
 
     Shakti.apply_mask_to_sliding!(s)   # re-zero ub_x/ub_y on any face touching an OTHER_BASIN cell
     Shakti.compute_abs_ub!(s)          # |u_b| from the new ub_x/ub_y
@@ -484,6 +514,9 @@ arrays are plain (Nx, Ny) arrays (unlike K24/HAB's Oceananigans fields), hence w
 function FastHydrology_to_Yelmo_Shakti!(yelmo, shakti_sim)
     interior(yelmo.dyn.N_eff, :, :, 1) .= shakti_sim.state.N
     interior(yelmo.thrm.H_w,  :, :, 1) .= shakti_sim.state.b   # gap height stands in for water-layer thickness
+    # capacity for the next gap update, from this step's b, N and |u_b| (Shakti.freeze_on_capacity!)
+    C_frz = Shakti.freeze_on_capacity!(zeros(size(shakti_sim.state.b)), shakti_sim)
+    _push_exchange!(yelmo; C_frz = C_frz, Q_diss = Array(shakti_sim.state.Q_diss), Q_sens = Array(shakti_sim.state.Q_sens))
 end
 
 # ── Coupling dispatch (per active FastHydrology model) ────────────────────────

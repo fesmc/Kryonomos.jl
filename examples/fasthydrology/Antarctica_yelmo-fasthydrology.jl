@@ -462,7 +462,9 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
     gap0   = fill(1e-3, Nx, Ny)   # initial gap height guess; no Yelmo equivalent
     ieb    = perYear2perSecond.(_melt_int(yelmo) .* (RHO_I / RHO_W))   # englacial water drained to the bed [m/s water]
 
-    p  = Shakti.ModelParameters(rho_i = RHO_I,
+    # b_max = 1 m (ISSM SHAKTI default) caps the negative-N runaway: where N < 0 creep opens the gap,
+    # and with no cap it grows without bound (Greenland 16 km coupled test: b -> 1e35 m at an edge cell).
+    p  = Shakti.ModelParameters(rho_i = RHO_I, b_max = 1.0,
                                 T_freeze = FROZEN_BED_THRESHOLD === nothing ? -1.0 : FROZEN_BED_THRESHOLD, # only used when the frozen bed is on, see FROZEN_BED_THRESHOLD
                                 T_hysteresis = FROZEN_BED_HYSTERESIS)
     # TODO/REMINDER (frozen bed): thawing regions needs b_min > 0. ModelParameters' default b_min = 0 reseeds thawed cells at

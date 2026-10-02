@@ -15,7 +15,7 @@
 # input/yelmo_phys_const.nml) and ice_data/. This script lives one level down,
 # so cd to the parent rather than to @__DIR__.
 cd(dirname(@__DIR__))
-import Pkg; Pkg.activate(".")
+import Pkg; Pkg.activate(get(ENV, "KRYO_PROJECT", "."))   # KRYO_PROJECT: e.g. a GPU copy of this env with its own LocalPreferences
 #######################################################################
 
 using Revise
@@ -129,7 +129,7 @@ const TIME_END_SHAKTI_YR  = parse(Float64, TIME_END_SHAKTI_DAYS) / 365.25
 # Both values are handed to Shakti's ModelParameters (`T_freeze`/`T_hysteresis`) in
 # build_hydrology_sim_Shakti; the freezing itself is `Shakti.update_frozen_mask!`.
 # K24/HAB have no FROZEN_BED concept, so this is ignored on those branches even if set.
-const FROZEN_BED_THRESHOLD  = nothing # K of T_prime_b, e.g. -1.0 (Yelmo's own bmb cutoff) to opt in
+const FROZEN_BED_THRESHOLD  = (v = get(ENV, "FROZEN_BED_THRESHOLD", "none"); v == "none" ? nothing : parse(Float64, v)) # K of T_prime_b, e.g. -1.0 (Yelmo bmb cutoff) to opt in
 const FROZEN_BED_HYSTERESIS = 0.5     # K; thaw threshold = FROZEN_BED_THRESHOLD + this (0 => no hysteresis)
 
 # ── Backend selection ────────────────────────────────────────────────────────
@@ -470,7 +470,9 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
 
     # b_max = 1 m (ISSM SHAKTI default) caps the negative-N runaway: where N < 0 creep opens the gap,
     # and with no cap it grows without bound (Greenland 16 km coupled test: b -> 1e35 m at an edge cell).
-    p  = Shakti.ModelParameters(rho_i = RHO_I, b_max = 1.0,
+    # SHAKTI_N_MIN: global floor on N [Pa] (default -Inf = none; 0 keeps water pressure <= overburden)
+    p  = Shakti.ModelParameters(rho_i = RHO_I, b_max = 1.0, N_min = parse(Float64, get(ENV, "SHAKTI_N_MIN", "-Inf")),
+                                b_min = parse(Float64, get(ENV, "SHAKTI_B_MIN", "1e-6")),
                                 T_freeze = FROZEN_BED_THRESHOLD === nothing ? -1.0 : FROZEN_BED_THRESHOLD, # only used when the frozen bed is on, see FROZEN_BED_THRESHOLD
                                 T_hysteresis = FROZEN_BED_HYSTERESIS)
     # TODO/REMINDER (frozen bed): thawing regions needs b_min > 0. ModelParameters' default b_min = 0 reseeds thawed cells at
@@ -546,7 +548,7 @@ water still held in a freezing cell is discarded (Shakti's `q_T` term is what gr
 it beforehand), see `Shakti.freeze_cells!`'s docstring. Returns Shakti's `(n_frozen, n_thawed,
 discarded_b)` summary."""
 function update_frozen_bed!(shakti_sim, yelmo)
-    T_prime_b = interior(yelmo.thrm.T_prime_b, :, :, 1)
+    T_prime_b = copyto!(similar(shakti_sim.state.b), Array(interior(yelmo.thrm.T_prime_b, :, :, 1)))   # onto the Shakti device
     return Shakti.update_frozen_mask!(shakti_sim.state, shakti_sim.p, T_prime_b)
 end
 

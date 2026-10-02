@@ -1,12 +1,11 @@
 ## Antarctica counterpart of Greenland_example_yelmo-fasthydro.jl -- same coupling recipe
 ## (FastHydrology K24/HAB/Shakti <-> Yelmo, both backends), different domain. Read that
 ## script first; this one is deliberately structured identically (same function names, same
-## order) so the two are easy to diff. Domain-specific pieces only: input data (ismip7 setup:
-## ANT-16KM, 381x381; tutorial setup: 191x191 @
+## order) so the two are easy to diff. Domain-specific pieces only: input data (191x191 @
 ## 32km vs 106x181 @ 16km), the Antarctica_mirror.nml Mirror namelist, and PLOT_DIR (its own
 ## subdirectory, so this never overwrites the Greenland script's plots).
 ##
-## Forcing: the default ismip7 setup restarts from the ISMIP7 ANT-16KM warm-start spin-up and keeps
+## Forcing: the default ismip7 setup restarts from the ISMIP7 ANT-32KM spin-up j32_ours and keeps
 ## its own smb/T_srf/Q_geo; the tutorial setup gets RACMO2.3 smb/T_srf and a constant Q_geo
 ## (apply_forcing_mirror!). Before, no forcing was set at all (a 0 K surface, no geothermal heat).
 
@@ -167,15 +166,16 @@ BACKEND in ("yelmo", "mirror") ||
 # file's own header comment. Shared with tutorial_yelmo_antarctica.jl, not duplicated here.
 const YELMO_NML_MIRROR = joinpath(dirname(RUN_DIR), "tutorial", "Antarctica_mirror.nml")
 
-# MIRROR_SETUP = "ismip7" (default): the ISMIP7 ANT-16KM warm-start spin-up of yelmox, restarted from
-# its 20 kyr state (optimised friction, spun-up temperature, its own smb/T_srf/Q_geo), with the
-# namelist Antarctica_ismip7_mirror.nml passed to Fortran verbatim (YelmoMirror's nml_file). Note the
-# grid is ANT-16KM (381 x 381): the ANT-32KM ISMIP7 spin-up collapsed (H_ice = 0, broken T_srf/smb).
+# MIRROR_SETUP = "ismip7" (default): the ISMIP7 ANT-32KM spin-up j32_ours of yelmox (Javi's parameters,
+# basin-wise tf_corr; reproduces his reference run), restarted from its 30 kyr state (optimised
+# friction, spun-up temperature, its own smb/T_srf/Q_geo), with the namelist
+# Antarctica_ismip7_mirror.nml passed to Fortran verbatim (YelmoMirror's nml_file). Not
+# spinup_ANT-32KM_full (collapsed: H_ice = 0, broken T_srf/smb).
 # "tutorial": the older ANT-32KM cold start (YELMO_NML_MIRROR, RACMO forcing pushed from Julia).
 const MIRROR_SETUP      = get(ENV, "MIRROR_SETUP", "ismip7")
 const YELMO_NML_ISMIP7  = joinpath(RUN_DIR, "Antarctica_ismip7_mirror.nml")
 const ISMIP7_RESTART    = get(ENV, "ISMIP7_RESTART",
-                              joinpath(homedir(), "yelmox/output/ismip7_ant/spinup_ANT-16KM_warmstart/restart-20.000-kyr/yelmo_restart.nc"))
+                              joinpath(homedir(), "yelmox/output/ismip7_ant/j32_ours/restart-30.000-kyr/yelmo_restart.nc"))
 
 # Mirror-only workaround: YelmoMirror's Fortran-side yelmo_init cannot safely be called a
 # second time in the same process when building from a file-based grid (grid=nothing, as

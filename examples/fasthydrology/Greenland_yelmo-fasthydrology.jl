@@ -523,8 +523,8 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
                                 N_min = parse(Float64, get(ENV, "SHAKTI_N_MIN", "-Inf")),
                                 b_min = parse(Float64, get(ENV, "SHAKTI_B_MIN", "1e-6")),
                                 clamp_budget = parse(Int, get(ENV, "SHAKTI_CLAMP_BUDGET", "0")),   # water budget where b is clamped (Shakti gap_budget_terms)
-                                outflow_only_land  = get(ENV, "SHAKTI_OUTFLOW_ONLY", "false") == "true",   # LAND/OCEAN faces only drain the ice (Shakti compute_face_masks!)
-                                outflow_only_ocean = get(ENV, "SHAKTI_OUTFLOW_ONLY", "false") == "true",
+                                outflow_only_land  = get(ENV, "SHAKTI_OUTFLOW_ONLY", "true") == "true",    # LAND/OCEAN faces only drain the ice (Shakti default; compute_face_masks!)
+                                outflow_only_ocean = get(ENV, "SHAKTI_OUTFLOW_ONLY", "true") == "true",
                                 T_freeze = FROZEN_BED_THRESHOLD === nothing ? -1.0 : FROZEN_BED_THRESHOLD, # only used when the frozen bed is on, see FROZEN_BED_THRESHOLD
                                 T_hysteresis = FROZEN_BED_HYSTERESIS)
     # TODO/REMINDER (frozen bed): thawing regions needs b_min > 0. ModelParameters' default b_min = 0 reseeds thawed cells at

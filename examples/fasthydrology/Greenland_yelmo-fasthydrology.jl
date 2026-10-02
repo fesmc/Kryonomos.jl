@@ -21,6 +21,7 @@ using Yelmo.YelmoMirrorPar: YelmoMirrorParameters  # YelmoMirror's parameter typ
                                                  # p.phys since Mirror keeps constants Fortran-side).
 using IceSheetBenchmarks
 using Statistics
+using NCDatasets
 using FastHydrology
 using Shakti
 
@@ -39,13 +40,17 @@ const YELMO_NML          = joinpath(dirname(RUN_DIR), "run01", "Greenland.nml") 
 const YELMO_REGIONS_FILE = joinpath(DATA_DIR, "GRL-16KM_REGIONS.nc")
 const YELMO_BASINS_FILE  = joinpath(DATA_DIR, "GRL-16KM_BASINS-nasa.nc")
 const YELMO_TOPO_FILE    = joinpath(DATA_DIR, "GRL-16KM_TOPO-M17-v5.nc")
+const GHF_FILE           = joinpath(dirname(RUN_DIR), "ice_data/Greenland/GRL-16KM/GRL-16KM_GHF-S04.nc")
+const CLIMATE_FILE       = joinpath(dirname(RUN_DIR), "ice_data/Greenland/GRL-16KM/GRL-16KM_MARv3.11-ERA_annmean_1961-1990.nc")
+const BMB_SHLF_CONST     = -0.5   # [m/yr]
 
 # Yelmo works in year-based units (velocities in m/yr, ATT in Pa^-3 yr^-1) while FastHydrology
 # (and Shakti) work in SI/second-based units, so every field crossing the coupling needs
-# perYear2perSecond. rho_i must match KazmierczakHydroModel's/Shakti's own rho_i default, since
-# it's used to convert Yelmo's ice-equivalent bmb_grnd into a mass melt rate for K24.
-const RHO_I = 917.0
+# perYear2perSecond. RHO_I and L_ICE are Yelmo's (&phys rho_ice, L_ice) and are passed to K24 and
+# Shakti too, so all three convert between ice, water and heat the same way.
+const RHO_I = 910.0
 const RHO_W = 1000.0
+const L_ICE = 333500.0
 
 # ── Basal source terms and the hydrology -> thermodynamics exchange ──────────
 # K24 and Shakti build their water source from the terms of the basal melt rate: geothermal heat G,
@@ -137,6 +142,16 @@ BACKEND in ("yelmo", "mirror") ||
 # tolerates but Fortran's nml_validate rejects as unknown -- see that file's header comment.
 # Shared with tutorial_yelmo_greenland.jl (same InitMIP-Greenland setup), not duplicated here.
 const YELMO_NML_MIRROR = joinpath(dirname(RUN_DIR), "tutorial", "Greenland_mirror.nml")
+
+# MIRROR_SETUP = "ismip7" (default): the ISMIP7 GRL-16KM spin-up of yelmox, restarted from its 15 kyr
+# state (optimised friction, spun-up temperature, its own smb/T_srf/Q_geo), with the namelist
+# Greenland_ismip7_mirror.nml passed to Fortran verbatim (YelmoMirror's nml_file), so no key is lost
+# in the Julia parameter structs. "tutorial": the older cold-start setup (YELMO_NML_MIRROR, constant
+# cf_ref, MAR forcing pushed from Julia).
+const MIRROR_SETUP      = get(ENV, "MIRROR_SETUP", "ismip7")
+const YELMO_NML_ISMIP7  = joinpath(RUN_DIR, "Greenland_ismip7_mirror.nml")
+const ISMIP7_RESTART    = get(ENV, "ISMIP7_RESTART",
+                              joinpath(homedir(), "yelmox/output/ismip7_grl/spinup_GRL-16KM/restart-15.000-kyr/yelmo_restart.nc"))
 
 # Mirror-only workaround: YelmoMirror's Fortran-side yelmo_init cannot safely be called a
 # second time in the same process when building from a file-based grid (grid=nothing, as
@@ -232,6 +247,9 @@ from `hyd%now%N` (FastHydrology's till closure) every step -- nothing ever pushe
 that branch, same reasoning as `yneff.method = 3` on the Julia side."""
 function build_yelmo_parameters_mirror(; external_neff::Bool)
     p = YelmoMirrorParameters(YELMO_NML_MIRROR, "Greenland")
+    # YELMO_RESTART: start from a full Yelmo restart (e.g. a spun-up state) instead of the cold start
+    rs = get(ENV, "YELMO_RESTART", "None")
+    rs == "None" || (p = _override_field(p, :yelmo, _override_field(p.yelmo, :restart, rs)))
 
     if external_neff
         hyd = _override_field(p.hyd, :bkt_N_closure, -1)
@@ -253,18 +271,78 @@ working directory (`RUN_DIR`, since the preamble `cd`s there) -- see
 `examples/ice_data/Greenland/GRL-16KM/` for the symlinks this relies on (same data as
 DATA_DIR, under the exact filenames the nml expects). No `init_topo_load!`/`init_masks!`
 equivalent is needed here; Fortran does that itself during `yelmo_init`."""
-function build_yelmo_mirror(; external_neff::Bool)
-    mkpath(RUN_DIR)
-    isfile(YELMO_NML_MIRROR) || error("Yelmo Mirror namelist not found: $YELMO_NML_MIRROR")
+_nml_val(v::Bool) = v ? ".true." : ".false."
+_nml_val(v::AbstractString) = "'" * v * "'"
+_nml_val(v) = string(v)
 
-    p = build_yelmo_parameters_mirror(; external_neff)
-    y = YelmoMirror(p, 0.0; alias="fasthydro_mirror", rundir=RUN_DIR, overwrite=true)
-    fill!(interior(y.bnd.H_sed), 100.0)
+"""Set `key = value` in namelist group `&group` of `txt` (replacing the key or appending it)."""
+function _nml_set(txt::AbstractString, group::AbstractString, key::AbstractString, val)
+    m = match(Regex("^&$(group)[ \\t]*\\n(.*?)^/", "ms"), txt)
+    m === nothing && error("namelist group &$group not found")
+    lines = split(chomp(m.captures[1]), '\n')
+    i = findfirst(l -> (k = match(r"^\s*(\w+)\s*=", l); k !== nothing && lowercase(k.captures[1]) == lowercase(key)), lines)
+    newl = " $(key) = $(_nml_val(val))"
+    i === nothing ? push!(lines, newl) : (lines[i] = newl)
+    return txt[1:prevind(txt, m.offset)] * "&$(group)\n" * join(lines, "\n") * "\n/" * txt[m.offset + ncodeunits(m.match):end]
+end
 
+"""The ISMIP7 namelist for one run: restart from `restart`, enthalpy thermodynamics with the capacity
+basal BC (capacity from the hydrology when coupled, from Yelmo's own till bucket otherwise), and N_eff
+set externally when coupled."""
+function mirror_nml_ismip7(; external_neff::Bool, restart = get(ENV, "YELMO_RESTART", ISMIP7_RESTART))
+    txt = read(YELMO_NML_ISMIP7, String)
+    txt = _nml_set(txt, "yelmo", "restart", restart)
+    txt = _nml_set(txt, "ytherm", "method", "enth")
+    txt = _nml_set(txt, "ytherm", "basal_bc_method", "capacity")
+    txt = _nml_set(txt, "ytherm", "cap_source", external_neff ? "hyd" : "till")
+    external_neff && (txt = _nml_set(txt, "yhyd", "bkt_N_closure", -1))
+    return txt
+end
+
+# rundir: one folder per Slurm job, so concurrent runs never share a namelist or output files
+function build_yelmo_mirror(; external_neff::Bool, alias = "fasthydro_mirror",
+                            rundir = joinpath(RUN_DIR, "runs", get(ENV, "SLURM_JOB_ID", "local")))
+    mkpath(rundir)
+    if MIRROR_SETUP == "ismip7"
+        nml = joinpath(rundir, alias * "_Greenland.nml")
+        write(nml, mirror_nml_ismip7(; external_neff))
+        p = YelmoMirrorParameters(nml, "Greenland")   # Julia-side view (constants, dt_min, H_ice_thin)
+        y = YelmoMirror(p, 0.0; alias, rundir, overwrite = true, nml_file = nml)
+        # smb, T_srf, Q_geo, cb_ref, ... come from the restart (read in init_state!)
+    else
+        isfile(YELMO_NML_MIRROR) || error("Yelmo Mirror namelist not found: $YELMO_NML_MIRROR")
+        p = build_yelmo_parameters_mirror(; external_neff)
+        y = YelmoMirror(p, 0.0; alias, rundir, overwrite = true)
+        fill!(interior(y.bnd.H_sed), 100.0)
+        apply_forcing_mirror!(y, p.phys.rho_ice, p.phys.rho_w)
+    end
     return p, y
 end
 
 # ── Coupling type hierarchy ───────────────────────────────────────────────────
+
+_read2d!(dest::AbstractMatrix, filename, varname) = NCDataset(ds -> (dest .= ds[varname][:, :]), filename)
+
+"""Present-day forcing for the Mirror backend (as tutorial_yelmo_greenland_hydrology_mirror.jl):
+MAR 1961-1990 smb and surface temperature, Shapiro & Ritzwoller (2004) geothermal heat flux,
+constant shelf melt. Without it the Fortran side runs with smb = T_srf = Q_geo = 0 (T_srf in K),
+i.e. a 0 K surface and no geothermal heat, which drives the whole bed far below melting."""
+function apply_forcing_mirror!(y, rho_ice, rho_w)
+    smb_conv  = 1.0e-3 * rho_w / rho_ice
+    smb_raw   = zeros(size(interior(y.bnd.smb_ref))[1:2])
+    T_srf_raw = zeros(size(smb_raw))
+    _read2d!(smb_raw,   CLIMATE_FILE, "smb")
+    _read2d!(T_srf_raw, CLIMATE_FILE, "T_srf")
+    interior(y.bnd.smb_ref)[:, :, 1] .= smb_raw .* smb_conv
+    interior(y.bnd.T_srf)[:, :, 1]   .= T_srf_raw .+ 273.15
+    smb   = @view interior(y.bnd.smb_ref)[:, :, 1]
+    H_ice = @view interior(y.tpo.H_ice)[:, :, 1]
+    @. smb = ifelse(H_ice <= 0.0, smb - 2.0, smb)
+    _read2d!((@view interior(y.bnd.Q_geo)[:, :, 1]), GHF_FILE, "ghf")
+    fill!(interior(y.bnd.bmb_shlf), BMB_SHLF_CONST)
+    fill!(interior(y.bnd.z_sl), 0.0)
+    return y
+end
 
 abstract type HydrologyCoupling end
 
@@ -310,7 +388,7 @@ function build_hydrology_sim_K24(yelmo)
     fill_iters    = 10    # iterations to fill local minima in potential field
 
     grid  = OGRectHydroGrid(Nx, Ny, xlims, ylims; T = T)
-    model = KazmierczakHydroModel(grid, kappa, abs_v_b, A_visc, G, q_T; i_eb = i_eb,
+    model = KazmierczakHydroModel(grid, kappa, abs_v_b, A_visc, G, q_T; i_eb = i_eb, rho_i = RHO_I, L_w = L_ICE,
                                   coupling_length_kamb86 = coupling_length_kamb86, fill_iters = fill_iters)
     state = HydroState(grid, mask, h, b)
     return SteadyStateSimulation(model, grid, state)
@@ -409,11 +487,7 @@ fields. Modeling choices with no direct Yelmo equivalent (flagged inline): Shakt
 categories, the initial gap height, and no moulin/point-source coupling (melt is generated
 internally from geothermal flux + frictional heating, matching Shakti's own real-glacier example).
 
-`dt_yr` (Yelmo's own outer timestep, in years) becomes Shakti's internal dt directly (converted to
-seconds) rather than a finer native Shakti timestep that couple_step! would sub-cycle -- one Shakti
-step per Yelmo step. Not physically resolved for Shakti's own (much faster) timescale, but this
-coupling is a smoke test of the push/step/pull cycle, not a physically converged Shakti run; see
-the DT_YR/TIME_END_YR comment above."""
+`dt_yr` is Shakti's own step (DT_SHAKTI_YR, hours); Yelmo advances every DT_YELMO_YR (see `_step!`)."""
 function build_hydrology_sim_Shakti(yelmo, dt_yr)
 
     T = Float64   # Shakti's own solvers are written for Float64
@@ -439,13 +513,12 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
     taub_x = interior(yelmo.dyn.taub_acx, :, :, 1)   # already in Pa, no time unit to convert
     taub_y = interior(yelmo.dyn.taub_acy, :, :, 1)
     G      = interior(yelmo.bnd.Q_geo, :, :, 1) .* 1e-3   # mW/m^2 -> W/m^2
-    gap0   = fill(1e-3, Nx, Ny)   # initial gap height guess; no Yelmo equivalent
     ieb    = perYear2perSecond.(_melt_int(yelmo) .* (RHO_I / RHO_W))   # englacial water drained to the bed [m/s water]
 
     # b_max = 1 m (ISSM SHAKTI default) caps the negative-N runaway: where N < 0 creep opens the gap,
     # and with no cap it grows without bound (Greenland 16 km coupled test: b -> 1e35 m at an edge cell).
     # SHAKTI_N_MIN: global floor on N [Pa] (default -Inf = none; 0 keeps water pressure <= overburden)
-    p  = Shakti.ModelParameters(rho_i = RHO_I, b_max = 1.0, N_min = parse(Float64, get(ENV, "SHAKTI_N_MIN", "-Inf")),
+    p  = Shakti.ModelParameters(rho_i = RHO_I, L = L_ICE, b_max = 1.0, N_min = parse(Float64, get(ENV, "SHAKTI_N_MIN", "-Inf")),
                                 b_min = parse(Float64, get(ENV, "SHAKTI_B_MIN", "1e-6")),
                                 T_freeze = FROZEN_BED_THRESHOLD === nothing ? -1.0 : FROZEN_BED_THRESHOLD, # only used when the frozen bed is on, see FROZEN_BED_THRESHOLD
                                 T_hysteresis = FROZEN_BED_HYSTERESIS)
@@ -457,6 +530,9 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
     mi = Shakti.ConstantMeltInput()
     sl = Shakti.PrescribedSlidingLaw()   # taub is supplied directly from Yelmo's own dynamics solve, not solved by Shakti
 
+    # initial gap: 1 mm where Yelmo's bed is temperate, b_min where it is frozen (water at a cold bed
+    # would only refreeze; no Yelmo equivalent of the gap height)
+    gap0  = ifelse.(interior(yelmo.thrm.T_prime_b, :, :, 1) .>= -0.1, 1e-3, p.b_min)
     state = Shakti.State(grid)
     Shakti.set_initial_conditions!(state, grid, p, sl, mask, A_visc, zb, zs, gap0, G, ub_x, ub_y, ieb, taub_x, taub_y)
 

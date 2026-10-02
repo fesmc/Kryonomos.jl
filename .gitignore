@@ -57,3 +57,8 @@ examples/archive/
 examples/input/
 examples/ismip7_validation/
 examples/fasthydrology/k24_yelmo_results/
+
+# Mirror run folders and generated namelists of the fasthydrology examples
+examples/fasthydrology/runs/
+examples/fasthydrology/yo_*/
+examples/fasthydrology/Greenland.nml

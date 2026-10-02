@@ -365,6 +365,38 @@ end
 
 # ── Shakti: build + coupling functions ────────────────────────────────────────
 
+"""Shakti's mask from Yelmo's current state. GROUNDED where Yelmo solves a grounded basal column:
+fully ice-covered (f_ice == 1), mostly grounded (f_grnd >= 0.5) and with a dynamic column H_ice_dyn
+(which carries partly covered front and grounding-line cells as full columns) thicker than
+ytherm.H_ice_thin -- Yelmo's own test for solving the column, so the two models book melt over the
+same area. Partly grounded cells (0 < f_grnd < 1) take Yelmo's mixed T_pmp/T_shlf basal condition,
+not the capacity rule; the majority-grounded ones are kept so grounding-line water drains to the ocean. Elsewhere OCEAN (bed below sea level) or LAND, the domain edge
+OTHER_BASIN (closed boundary), and an isolated GROUNDED cell (no GROUNDED neighbour) OTHER_BASIN too:
+all its face conductances vanish, so its matrix row would be zero and the Cholesky factorization fail."""
+function _shakti_mask(yelmo)
+    Nx, Ny = yelmo.g.Nx, yelmo.g.Ny
+    f_ice  = interior(yelmo.tpo.f_ice, :, :, 1)
+    f_grnd = interior(yelmo.tpo.f_grnd, :, :, 1)
+    H      = interior(yelmo.tpo.H_ice_dyn, :, :, 1)
+    zb     = interior(yelmo.bnd.z_bed, :, :, 1)
+    H_thin = hasproperty(yelmo.p.ytherm, :H_ice_thin) ? yelmo.p.ytherm.H_ice_thin : 10.0   # Yelmo default
+    mask = fill(Shakti.OTHER_BASIN, Nx, Ny)
+    for j in 1:Ny, i in 1:Nx
+        mask[i, j] = (f_ice[i, j] == 1 && f_grnd[i, j] >= 0.5 && H[i, j] > H_thin) ? Shakti.GROUNDED :
+                     zb[i, j] < 0 ? Shakti.OCEAN : Shakti.LAND
+    end
+    mask[[1, Nx], :] .= Shakti.OTHER_BASIN
+    mask[:, [1, Ny]] .= Shakti.OTHER_BASIN
+    for j in 2:(Ny - 1), i in 2:(Nx - 1)
+        if mask[i, j] == Shakti.GROUNDED
+            mask[i+1, j] == Shakti.GROUNDED || mask[i-1, j] == Shakti.GROUNDED ||
+            mask[i, j+1] == Shakti.GROUNDED || mask[i, j-1] == Shakti.GROUNDED || (mask[i, j] = Shakti.OTHER_BASIN)
+        end
+    end
+    return mask
+end
+
+
 """Build a FastHydrology TimeSimulation wrapping a Shakti simulation, seeded from `yelmo`'s current
 fields. Modeling choices with no direct Yelmo equivalent (flagged inline): Shakti's mask
 categories, the initial gap height, and no moulin/point-source coupling (melt is generated
@@ -384,42 +416,9 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
 
     grid = Shakti.Grid(Nx, Ny, T((Nx - 1) * dx), T((Ny - 1) * dy))
 
-    # Shakti's GROUNDED is the same physical concept as FastHydrology's HydroState.mask == 1
-    # (grounded ice present) -- just one of four categories here (vs a boolean there), since
-    # Shakti also needs to distinguish ocean/land/other-basin among the non-grounded cells that
-    # K24/HAB never look at. Built independently (not derived from a HydroState), and static for
-    # the whole run -- set only here, not per step.
-    grounded_frac = _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd)
-    zb0 = interior(yelmo.bnd.z_bed, :, :, 1)
-    mask = fill(Shakti.OTHER_BASIN, Nx, Ny)
-    for j in 1:Ny, i in 1:Nx
-        if grounded_frac[i, j] >= 0.5
-            mask[i, j] = Shakti.GROUNDED
-        elseif zb0[i, j] < 0
-            mask[i, j] = Shakti.OCEAN
-        else
-            mask[i, j] = Shakti.LAND
-        end
-    end
-    mask[[1, Nx], :] .= Shakti.OTHER_BASIN   # close off the domain edge (closed-boundary convention)
-    mask[:, [1, Ny]] .= Shakti.OTHER_BASIN
+    mask = _shakti_mask(yelmo)   # also re-applied every coupling step (Yelmo_to_FastHydrology_Shakti!)
 
-    # A GROUNDED cell with no GROUNDED neighbour has no flow path into the rest of the domain:
-    # every face conductance touching it comes out zero (Shakti.boundary_K_face needs both sides
-    # GROUNDED to be nonzero), and the Newton-linearized creep-closure reaction term vanishes too
-    # once effective pressure goes deeply negative there (as it does at a thin, near-flotation
-    # single-pixel grounded cell) -- so its assembled row is an exact zero, and CholeskyDirectSolver's
-    # factorization fails with PosDefException. Reclassify such cells as OTHER_BASIN (frozen/inert,
-    # same treatment as a genuinely disconnected grounded-ice basin) rather than solving for them.
-    for j in 2:(Ny - 1), i in 2:(Nx - 1)
-        if mask[i, j] == Shakti.GROUNDED
-            has_grounded_neighbor = mask[i+1, j] == Shakti.GROUNDED || mask[i-1, j] == Shakti.GROUNDED ||
-                                     mask[i, j+1] == Shakti.GROUNDED || mask[i, j-1] == Shakti.GROUNDED
-            has_grounded_neighbor || (mask[i, j] = Shakti.OTHER_BASIN)
-        end
-    end
-
-    zb     = zb0
+    zb     = interior(yelmo.bnd.z_bed, :, :, 1)
     H      = interior(yelmo.tpo.H_ice, :, :, 1)
     # Shakti derives H = zs - zb - b internally (compute_H!), so zs must be reconstructed as
     # zb + H_ice here rather than read from yelmo.tpo.z_srf directly: z_srf is referenced to sea
@@ -465,8 +464,7 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
 end
 
 """Push Yelmo's current ice geometry, rheology, and basal stress/velocity into the wrapped Shakti
-simulation. Shakti's mask is static per run (set only in build_hydrology_sim_Shakti), so it is not
-touched here. Unlike `set_initial_conditions!`, Shakti's own per-timestep `step!` does *not*
+simulation, and Shakti's mask from Yelmo's (`_shakti_mask`, `Shakti.set_mask!`). Unlike `set_initial_conditions!`, Shakti's own per-timestep `step!` does *not*
 re-derive H/po/abs_ub from zs/zb/ub_x/ub_y on its own (only `set_initial_conditions!` and
 `compute_beta!` -- called internally each step -- touch those), so this has to call the matching
 `compute_*!` refreshers explicitly after pushing the raw fields, or the coupling would silently
@@ -490,6 +488,9 @@ function Yelmo_to_FastHydrology_Shakti!(shakti_sim, yelmo)
     s.q_T    .= _q_T(yelmo)
     s.ieb    .= perYear2perSecond.(_melt_int(yelmo) .* (RHO_I / RHO_W))   # read as-is by ConstantMeltInput
 
+    Shakti.compute_H!(s)
+    Shakti.compute_po!(s, shakti_sim.p)
+    Shakti.set_mask!(s, shakti_sim.p, _shakti_mask(yelmo))   # follow Yelmo's grounded, solved cells
     Shakti.apply_mask_to_sliding!(s)   # re-zero ub_x/ub_y on any face touching an OTHER_BASIN cell
     Shakti.compute_abs_ub!(s)          # |u_b| from the new ub_x/ub_y
     Shakti.compute_H!(s)               # ice thickness from the new zs/zb/b

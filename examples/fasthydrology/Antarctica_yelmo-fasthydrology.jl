@@ -107,6 +107,13 @@ const TIME_END_YR = 4.0
 # branches (a full 40yr run at 1-3 hours/step is 100k+ steps, impractical here).
 const DT_SHAKTI_HOURS     = get(ENV, "DT_SHAKTI_HOURS", "2.0")
 const DT_SHAKTI_YR        = parse(Float64, DT_SHAKTI_HOURS) / (24.0 * 365.25)
+# Yelmo is advanced (and exchanges fields with Shakti) only every DT_YELMO_YR, not every Shakti
+# step: each YelmoMirror step! syncs every field both ways, and its ice state changes on that
+# timescale anyway. Shakti keeps stepping at DT_SHAKTI_HOURS in between.
+const DT_YELMO_YR         = parse(Float64, get(ENV, "DT_YELMO_YR", "0.1"))
+# Shakti linear solver: "cholesky" (CPU) or "cg_mf" (matrix-free Jacobi CG; with Shakti's CUDA
+# backend this was the fastest on ice-sheet grids, ~20x CPU Cholesky on Greenland 16 km).
+const SHAKTI_SOLVER       = get(ENV, "SHAKTI_SOLVER", "cholesky")
 const TIME_END_SHAKTI_DAYS = get(ENV, "TIME_END_SHAKTI_DAYS", "5.0")
 const TIME_END_SHAKTI_YR  = parse(Float64, TIME_END_SHAKTI_DAYS) / 365.25
 
@@ -477,7 +484,9 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
     state = Shakti.State(grid)
     Shakti.set_initial_conditions!(state, grid, p, sl, mask, A_visc, zb, zs, gap0, G, ub_x, ub_y, ieb, taub_x, taub_y)
 
-    ls = Shakti.CholeskyDirectSolver(grid)
+    ls = SHAKTI_SOLVER == "cg_mf"    ? Shakti.CGIterativeSolver(grid, Shakti.MatrixFreeLinearSystem) :
+         SHAKTI_SOLVER == "cholesky" ? Shakti.CholeskyDirectSolver(grid) :
+         error("SHAKTI_SOLVER = $SHAKTI_SOLVER (use \"cholesky\" or \"cg_mf\")")
     ps = Shakti.PicardSolver(500, 1e-6, ls, grid)
 
     # tsteps is inert here: it only matters for Shakti.run!'s own loop/observer bookkeeping, and
@@ -498,21 +507,23 @@ keep using the ice geometry/velocity from `build_hydrology_sim_Shakti`'s initial
 function Yelmo_to_FastHydrology_Shakti!(shakti_sim, yelmo)
     s = shakti_sim.state
 
-    s.zb .= interior(yelmo.bnd.z_bed, :, :, 1)
+    # copyto! (not .=) so the same code fills CPU or GPU (Shakti CUDA backend) state arrays
+    zb    = interior(yelmo.bnd.z_bed, :, :, 1)
+    copyto!(s.zb, Array(zb))
     H_ice = interior(yelmo.tpo.H_ice, :, :, 1)
     # Reconstructed as zb + H_ice, not read from yelmo.tpo.z_srf -- see build_hydrology_sim_Shakti's
     # comment: z_srf is sea-level-referenced over open ocean, not zb + H_ice, and Shakti's own
     # H = zs - zb - b derivation would otherwise read ocean depth as ice thickness there.
-    s.zs .= s.zb .+ H_ice
+    copyto!(s.zs, zb .+ H_ice)
 
-    s.A_visc .= perYear2perSecond.(mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1])
-    s.ub_x   .= perYear2perSecond.(interior(yelmo.dyn.ux_b, :, :, 1))
-    s.ub_y   .= perYear2perSecond.(interior(yelmo.dyn.uy_b, :, :, 1))
-    s.taub_x .= interior(yelmo.dyn.taub_acx, :, :, 1)
-    s.taub_y .= interior(yelmo.dyn.taub_acy, :, :, 1)
-    s.G      .= interior(yelmo.bnd.Q_geo, :, :, 1) .* 1e-3
-    s.q_T    .= _q_T(yelmo)
-    s.ieb    .= perYear2perSecond.(_melt_int(yelmo) .* (RHO_I / RHO_W))   # read as-is by ConstantMeltInput
+    copyto!(s.A_visc, Array(perYear2perSecond.(mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1])))
+    copyto!(s.ub_x, Array(perYear2perSecond.(interior(yelmo.dyn.ux_b, :, :, 1))))
+    copyto!(s.ub_y, Array(perYear2perSecond.(interior(yelmo.dyn.uy_b, :, :, 1))))
+    copyto!(s.taub_x, Array(interior(yelmo.dyn.taub_acx, :, :, 1)))
+    copyto!(s.taub_y, Array(interior(yelmo.dyn.taub_acy, :, :, 1)))
+    copyto!(s.G, Array(interior(yelmo.bnd.Q_geo, :, :, 1) .* 1e-3))
+    copyto!(s.q_T, Array(_q_T(yelmo)))
+    copyto!(s.ieb, Array(perYear2perSecond.(_melt_int(yelmo) .* (RHO_I / RHO_W))))   # read as-is by ConstantMeltInput
 
     Shakti.compute_H!(s)
     Shakti.compute_po!(s, shakti_sim.p)
@@ -542,14 +553,14 @@ end
 """Copy Shakti's effective pressure / gap height back into Yelmo boundary fields. Shakti's state
 arrays are plain (Nx, Ny) arrays (unlike K24/HAB's Oceananigans fields), hence writing through
 `interior(...)` on the Yelmo side."""
-function FastHydrology_to_Yelmo_Shakti!(yelmo, shakti_sim)
-    interior(yelmo.dyn.N_eff, :, :, 1) .= shakti_sim.state.N
-    interior(yelmo.thrm.H_w,  :, :, 1) .= shakti_sim.state.b   # gap height stands in for water-layer thickness
+function FastHydrology_to_Yelmo_Shakti!(yelmo, shakti_sim;
+        dt_host = max(shakti_sim.dt[], yelmo.p.yelmo.dt_min * FastHydrology.SECONDS_PER_YEAR))
+    interior(yelmo.dyn.N_eff, :, :, 1) .= Array(shakti_sim.state.N)
+    interior(yelmo.thrm.H_w,  :, :, 1) .= Array(shakti_sim.state.b)   # gap height stands in for water-layer thickness
     # capacity for the next gap update, from this step's b, N and |u_b| (Shakti.freeze_on_capacity!)
-    # The gap room is a stock available once per Yelmo step, and Yelmo advances in chunks of at
-    # least dt_min while Shakti subcycles in hours, so it is spread over the Yelmo step.
-    dt_host = max(shakti_sim.dt[], yelmo.p.yelmo.dt_min * FastHydrology.SECONDS_PER_YEAR)
-    C_frz = Shakti.freeze_on_capacity!(zeros(size(shakti_sim.state.b)), shakti_sim; dt = dt_host)
+    # The gap room is a stock available once per Yelmo step (dt_host [s], the coming Yelmo step),
+    # while Shakti subcycles in hours, so it is spread over the Yelmo step.
+    C_frz = Array(Shakti.freeze_on_capacity!(fill!(similar(shakti_sim.state.b), 0), shakti_sim; dt = dt_host))
     _push_exchange!(yelmo; C_frz = C_frz, Q_diss = Array(shakti_sim.state.Q_diss), Q_sens = Array(shakti_sim.state.Q_sens))
 end
 
@@ -592,8 +603,31 @@ end
 
 """Single timestep with active hydrology coupling."""
 function step!(coupling::CoupledHydrology, yelmo, t, dt)
-    couple_step!(coupling.sim.model, coupling.sim, yelmo, dt; frozen_bed_threshold = coupling.frozen_bed_threshold)
+    _step!(coupling.sim.model, coupling, yelmo, t, dt)
+end
+function _step!(model, coupling, yelmo, t, dt)
+    couple_step!(model, coupling.sim, yelmo, dt; frozen_bed_threshold = coupling.frozen_bed_threshold)
     Yelmo.step!(yelmo, dt)
+end
+
+const _shakti_read_at = Ref(NaN)   # Yelmo time Shakti last read its fields at
+
+"""Shakti: step Shakti every call (dt = its own step), and Yelmo only once `t` is DT_YELMO_YR past
+Yelmo's time. Shakti re-reads Yelmo's fields (and mask) only after Yelmo has moved, and pushes N,
+C, Q_diss, Q_sens right before each Yelmo step, with C spread over that Yelmo step."""
+function _step!(model::ShaktiHydroModel, coupling, yelmo, t, dt)
+    ss = model.sim
+    if yelmo.time != _shakti_read_at[]
+        Yelmo_to_FastHydrology_Shakti!(ss, yelmo)
+        coupling.frozen_bed_threshold !== nothing && update_frozen_bed!(ss, yelmo)
+        _shakti_read_at[] = yelmo.time
+    end
+    FastHydrology.step!(coupling.sim)
+    dt_y = t - yelmo.time
+    if dt_y >= DT_YELMO_YR - 1e-3dt
+        FastHydrology_to_Yelmo_Shakti!(yelmo, ss; dt_host = max(ss.dt[], dt_y * FastHydrology.SECONDS_PER_YEAR))
+        Yelmo.step!(yelmo, dt_y)
+    end
 end
 
 """Single timestep, hydrology disabled — Yelmo advances alone."""

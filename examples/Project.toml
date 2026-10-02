@@ -14,3 +14,6 @@ IceSheetBenchmarks = {url = "https://github.com/fesmc/IceSheetBenchmarks.jl.git"
 Yelmo = {path = "/albedo/home/taange001/Yelmo.jl"}
 Shakti = {path = "/albedo/home/taange001/Shakti.jl"}
 FastHydrology = {path = "/albedo/home/taange001/FastHydrology.jl"}
+
+[extras]
+CUDA_Runtime_jll = "76a88914-d11a-5bdc-97e0-2f5a05c973a2"

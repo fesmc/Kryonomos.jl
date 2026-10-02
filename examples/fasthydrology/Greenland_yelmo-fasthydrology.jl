@@ -518,8 +518,13 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
     # b_max = 1 m (ISSM SHAKTI default) caps the negative-N runaway: where N < 0 creep opens the gap,
     # and with no cap it grows without bound (Greenland 16 km coupled test: b -> 1e35 m at an edge cell).
     # SHAKTI_N_MIN: global floor on N [Pa] (default -Inf = none; 0 keeps water pressure <= overburden)
-    p  = Shakti.ModelParameters(rho_i = RHO_I, L = L_ICE, b_max = 1.0, N_min = parse(Float64, get(ENV, "SHAKTI_N_MIN", "-Inf")),
+    p  = Shakti.ModelParameters(rho_i = RHO_I, L = L_ICE, b_max = parse(Float64, get(ENV, "SHAKTI_B_MAX", "1.0")),
+                                mdot_includes_potential = get(ENV, "SHAKTI_MDOT_POTENTIAL", "true") == "true",
+                                N_min = parse(Float64, get(ENV, "SHAKTI_N_MIN", "-Inf")),
                                 b_min = parse(Float64, get(ENV, "SHAKTI_B_MIN", "1e-6")),
+                                clamp_budget = parse(Int, get(ENV, "SHAKTI_CLAMP_BUDGET", "0")),   # water budget where b is clamped (Shakti gap_budget_terms)
+                                outflow_only_land  = get(ENV, "SHAKTI_OUTFLOW_ONLY", "false") == "true",   # LAND/OCEAN faces only drain the ice (Shakti compute_face_masks!)
+                                outflow_only_ocean = get(ENV, "SHAKTI_OUTFLOW_ONLY", "false") == "true",
                                 T_freeze = FROZEN_BED_THRESHOLD === nothing ? -1.0 : FROZEN_BED_THRESHOLD, # only used when the frozen bed is on, see FROZEN_BED_THRESHOLD
                                 T_hysteresis = FROZEN_BED_HYSTERESIS)
     # TODO/REMINDER (frozen bed): thawing regions needs b_min > 0. ModelParameters' default b_min = 0 reseeds thawed cells at

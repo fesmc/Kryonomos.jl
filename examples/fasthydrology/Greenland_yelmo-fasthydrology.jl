@@ -374,6 +374,19 @@ struct NoCoupling <: HydrologyCoupling end
 
 # ── K24 (Kazmierczak et al. 2024): build + coupling functions ─────────────────
 
+# K24's frictional heat comes from a sliding law. "field" (default, K24 sliding law 4) is
+# PrescribedFieldSlidingLaw with Yelmo's own basal stress tau_b, refreshed every step; "none" is
+# NoFrictionSlidingLaw. With no friction K24's source at cold bases becomes -Q_b/L (q_T already
+# contains the frictional heat), and N and u_b alternate step to step.
+const K24_SLIDING = get(ENV, "K24_SLIDING", "field")
+K24_SLIDING in ("field", "none") || error("K24_SLIDING must be 'field' or 'none', got '$K24_SLIDING'")
+# K24 is steady, so N is a function of u_b. Computed once per Yelmo step from the previous u_b, N and
+# u_b alternate between two states (a 2-step cycle in thousands of cells). With K24_UB_HOOK=1
+# (default) Yelmo's DIVA iteration re-evaluates N from each iteration's u_b through
+# `yelmo.hooks.neff_from_ub` (FastHydrology.N_from_ub!, routing held from the step's full K24 update),
+# so N and u_b converge together. 0 restores the once-per-step N. Julia backend only.
+const K24_UB_HOOK = get(ENV, "K24_UB_HOOK", "1") != "0"
+
 """Build a FastHydrology SteadyStateSimulation wrapping KazmierczakHydroModel, from `yelmo`'s current fields."""
 function build_hydrology_sim_K24(yelmo)
 
@@ -398,8 +411,11 @@ function build_hydrology_sim_K24(yelmo)
     fill_iters    = 10    # iterations to fill local minima in potential field
 
     grid  = OGRectHydroGrid(Nx, Ny, xlims, ylims; T = T)
+    sliding_law = K24_SLIDING == "field" ? PrescribedFieldSlidingLaw(grid, T.(interior(yelmo.dyn.taub, :, :, 1))) :
+                                           NoFrictionSlidingLaw()
     model = KazmierczakHydroModel(grid, kappa, abs_v_b, A_visc, G, q_T; i_eb = i_eb, rho_i = RHO_I, L_w = L_ICE,
-                                  coupling_length_kamb86 = coupling_length_kamb86, fill_iters = fill_iters)
+                                  coupling_length_kamb86 = coupling_length_kamb86, fill_iters = fill_iters,
+                                  sliding_law = sliding_law)
     state = HydroState(grid, mask, h, b)
     return SteadyStateSimulation(model, grid, state)
 end
@@ -414,6 +430,31 @@ function Yelmo_to_FastHydrology_K24!(sim, yelmo)
     set_basal_terms!(sim.model; G = _G(yelmo), q_T = _q_T(yelmo),
                      i_eb = perYear2perSecond.(_melt_int(yelmo) .* RHO_I))
     fill!(sim.model.kappa, 0)
+    K24_SLIDING == "field" && (sim.model.sliding_law.tau_b .= interior(yelmo.dyn.taub, :, :, 1))   # [Pa]
+end
+
+"""Install the DIVA-iteration hook that re-evaluates K24's N from the iteration's basal velocity
+(`yelmo.hooks.neff_from_ub`, see YelmoHooks.jl). N comes from `FastHydrology.N_from_ub!`: the routing
+(q, |grad phi|, phi0) stays as the step's full K24 update (`couple_step!`) left it; the geometry and
+rate factor the velocity solve uses are refreshed in place, as the inputs of that update were.
+Requires `yneff.method = -1` (set by `external_neff`). A no-op for models whose N does not respond to
+u_b, and for the Mirror backend (the Fortran hook lives in Yelmo's own driver)."""
+install_ub_hook!(coupling, yelmo) = nothing
+function install_ub_hook!(coupling::CoupledHydrology{<:SteadyStateSimulation{<:KazmierczakHydroModel}}, yelmo)
+    (K24_UB_HOOK && BACKEND == "yelmo") || return nothing
+    sim = coupling.sim
+    FastHydrology.N_responds_to_ub(sim.model) || return nothing
+    yelmo.hooks.neff_from_ub = function (N_eff, ux_b, uy_b)
+        uxy_b = yelmo.dyn.uxy_b   # scratch aa field: rebuilt by Yelmo's end-of-step diagnostics
+        Yelmo.calc_magnitude_from_staggered!(uxy_b, ux_b, uy_b, yelmo.tpo.f_ice_dyn)
+        sim.state.mask   .= _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd) .> 0
+        sim.state.h      .= interior(yelmo.tpo.H_ice, :, :, 1)
+        sim.model.A_visc .= perYear2perSecond.(mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1])
+        FastHydrology.N_from_ub!(sim.model, sim.grid, sim.state, perYear2perSecond.(interior(uxy_b, :, :, 1)))
+        interior(N_eff, :, :, 1) .= sim.state.N
+        return nothing
+    end
+    return nothing
 end
 
 """Copy FastHydrology outputs → Yelmo boundary fields (K24)."""
@@ -791,6 +832,7 @@ function main()
         # otherwise each branch would continue from wherever the previous one left off.
         yelmo    = setup_yelmo(; external_neff = external_neff_list[idx])
         coupling = make_coupling(yelmo)
+        install_ub_hook!(coupling, yelmo)
 
         # Write to file
         # yelmo_output_groups = [:tpo, :dyn, :thrm, :mat, :bnd]

@@ -1,0 +1,48 @@
+# Short K24-coupled Greenland run on the Julia Yelmo backend, writing N_eff and f_grnd at every
+# step to <outdir>/yelmo.nc so that ~/build_jobs/cyc.jl can count the cells whose N alternates by
+# more than 10% over the last 7 outputs. Run it twice, K24_UB_HOOK=0 and K24_UB_HOOK=1:
+#
+#   julia --project=<examples env> k24_ub_hook_cycles.jl <outdir> [dt_yr=0.1] [time_end_yr=2.0]
+#
+# Reference (Fortran, GRL-16KM, 2 yr in 0.1 yr steps): 3215 cycling cells without the hook, 95-562 with it.
+ENV["KRYO_NO_MAIN"] = "1"
+include(joinpath(@__DIR__, "Greenland_yelmo-fasthydrology.jl"))
+
+function main_cycles(outdir, dt, time_end)
+    mkpath(outdir)
+    BACKEND == "yelmo" || error("the hook acts on the Julia backend; set FASTHYDRO_BACKEND=yelmo")
+    @info "K24 on Julia Yelmo" hook = K24_UB_HOOK sliding = K24_SLIDING dt time_end
+
+    yelmo    = setup_yelmo(; external_neff = true)
+    coupling = CoupledHydrology(build_hydrology_sim_K24(yelmo))
+    install_ub_hook!(coupling, yelmo)
+    @info "hook installed" installed = (yelmo.hooks.neff_from_ub !== nothing)
+
+    nx, ny = yelmo.g.Nx, yelmo.g.Ny
+    nsteps = round(Int, time_end / dt)
+    ds = NCDataset(joinpath(outdir, "yelmo.nc"), "c")
+    defDim(ds, "x", nx); defDim(ds, "y", ny); defDim(ds, "time", nsteps + 1)
+    vt = defVar(ds, "time", Float64, ("time",))
+    vN = defVar(ds, "N_eff", Float64, ("x", "y", "time"))
+    vg = defVar(ds, "f_grnd", Float64, ("x", "y", "time"))
+    vu = defVar(ds, "uxy_b", Float64, ("x", "y", "time"))
+    iters = Int[]
+    function save(k)
+        vt[k]        = yelmo.time
+        vN[:, :, k]  = interior(yelmo.dyn.N_eff, :, :, 1)
+        vg[:, :, k]  = interior(yelmo.tpo.f_grnd, :, :, 1)
+        vu[:, :, k]  = interior(yelmo.dyn.uxy_b, :, :, 1)
+    end
+    save(1)
+    for k in 1:nsteps
+        t0 = time()
+        step!(coupling, yelmo, k * dt, dt)
+        push!(iters, yelmo.dyn.scratch.ssa_iter_now[])
+        save(k + 1)
+        @info "step $k  t=$(round(yelmo.time; digits = 3)) yr  Picard iters $(iters[end])  $(round(time() - t0; digits = 1)) s"
+    end
+    close(ds)
+    @info "mean Picard iterations per step" mean(iters)
+end
+
+main_cycles(ARGS[1], parse(Float64, get(ARGS, 2, "0.1")), parse(Float64, get(ARGS, 3, "2.0")))

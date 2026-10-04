@@ -305,6 +305,7 @@ function mirror_nml_ismip7(; external_neff::Bool, restart = get(ENV, "YELMO_REST
     txt = _nml_set(txt, "ytherm", "cap_source", external_neff ? "hyd" : "till")
     external_neff && (txt = _nml_set(txt, "yhyd", "bkt_N_closure", -1))
     haskey(ENV, "YELMO_CAP_COLD_TOL") && (txt = _nml_set(txt, "ytherm", "cap_cold_tol", parse(Float64, ENV["YELMO_CAP_COLD_TOL"])))   # [K], Yelmo capacity rule cold-base tolerance
+    haskey(ENV, "YELMO_QB_METHOD") && (txt = _nml_set(txt, "ytherm", "qb_method", parse(Int, ENV["YELMO_QB_METHOD"])))   # Yelmo basal frictional heating form (1 faces, 2 faces at quadrature nodes)
     return txt
 end
 

@@ -613,7 +613,6 @@ function Yelmo_to_FastHydrology_Shakti!(shakti_sim, yelmo)
     Shakti.compute_H!(s)
     Shakti.compute_po!(s, shakti_sim.p)
     Shakti.set_mask!(s, shakti_sim.p, _shakti_mask(yelmo))   # follow Yelmo's grounded, solved cells
-    Shakti.apply_mask_to_sliding!(s)   # re-zero ub_x/ub_y on any face touching an OTHER_BASIN cell
     Shakti.compute_abs_ub!(s)          # |u_b| from the new ub_x/ub_y
     Shakti.compute_H!(s)               # ice thickness from the new zs/zb/b
     Shakti.compute_po!(s, shakti_sim.p) # overburden pressure from the new H

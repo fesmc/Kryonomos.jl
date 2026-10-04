@@ -84,6 +84,12 @@ const BMB_SHLF_CONST = -0.5   # [m/yr]
 
 """Heat conducted from the bed into the ice [W/m^2] (Yelmo's Q_ice_b, mW/m^2)."""
 _q_T(yelmo) = interior(yelmo.thrm.Q_ice_b, :, :, 1) .* 1e-3
+# Heat from below [W/m^2] for the hydrology's melt balance: the flux at the top of Yelmo's bedrock
+# column (Q_rock), which is what Yelmo's own basal balance uses -- not Q_geo at depth, which differs
+# while the bedrock is still warming. With Q_geo, L*mdot = G + Q_b + Q_wat - q_T is off from Yelmo's
+# balance by Q_geo - Q_rock. SHAKTI_G_SOURCE=geo restores the old behaviour.
+const G_SOURCE = get(ENV, "SHAKTI_G_SOURCE", "rock")
+_G(yelmo) = interior(G_SOURCE == "geo" ? yelmo.bnd.Q_geo : yelmo.thrm.Q_rock, :, :, 1) .* 1e-3
 
 """Englacial water drained to the bed [m/yr ice equivalent] (Yelmo's melt_int; zero where the
 backend does not provide it)."""
@@ -407,7 +413,7 @@ function build_hydrology_sim_K24(yelmo)
     abs_v_b = perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1))              # basal speed
     A_visc  = perYear2perSecond.(mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1])  # depth-averaged rate factor
     # Water source from terms [W/m^2] and water from above [kg/m^2/s] (see _q_T/_melt_int).
-    G       = interior(yelmo.bnd.Q_geo, :, :, 1) .* 1e-3
+    G       = _G(yelmo)
     q_T     = _q_T(yelmo)
     i_eb    = perYear2perSecond.(_melt_int(yelmo) .* RHO_I)
     kappa   = zeros(T, Nx, Ny)   # bed hardness (0: hard, 1: soft)
@@ -429,7 +435,7 @@ function Yelmo_to_FastHydrology_K24!(sim, yelmo)
     sim.state.b       .= interior(yelmo.bnd.z_bed, :, :, 1)
     sim.model.abs_v_b .= perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1))
     sim.model.A_visc  .= perYear2perSecond.(mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1])
-    set_basal_terms!(sim.model; G = interior(yelmo.bnd.Q_geo, :, :, 1) .* 1e-3, q_T = _q_T(yelmo),
+    set_basal_terms!(sim.model; G = _G(yelmo), q_T = _q_T(yelmo),
                      i_eb = perYear2perSecond.(_melt_int(yelmo) .* RHO_I))
     fill!(sim.model.kappa, 0)
 end
@@ -540,7 +546,7 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
     ub_y   = perYear2perSecond.(interior(yelmo.dyn.uy_b, :, :, 1))
     taub_x = interior(yelmo.dyn.taub_acx, :, :, 1)   # already in Pa, no time unit to convert
     taub_y = interior(yelmo.dyn.taub_acy, :, :, 1)
-    G      = interior(yelmo.bnd.Q_geo, :, :, 1) .* 1e-3   # mW/m^2 -> W/m^2 - WARNING: this field might contain a -9999.0 fill sentinel
+    G      = _G(yelmo)   # mW/m^2 -> W/m^2 - WARNING: this field might contain a -9999.0 fill sentinel
     ieb    = perYear2perSecond.(_melt_int(yelmo) .* (RHO_I / RHO_W))   # englacial water drained to the bed [m/s water]
 
     # b_max = 1 m (ISSM SHAKTI default) caps the negative-N runaway: where N < 0 creep opens the gap,
@@ -606,7 +612,7 @@ function Yelmo_to_FastHydrology_Shakti!(shakti_sim, yelmo)
     copyto!(s.ub_y, Array(perYear2perSecond.(interior(yelmo.dyn.uy_b, :, :, 1))))
     copyto!(s.taub_x, Array(interior(yelmo.dyn.taub_acx, :, :, 1)))
     copyto!(s.taub_y, Array(interior(yelmo.dyn.taub_acy, :, :, 1)))
-    copyto!(s.G, Array(interior(yelmo.bnd.Q_geo, :, :, 1) .* 1e-3))
+    copyto!(s.G, Array(_G(yelmo)))
     copyto!(s.q_T, Array(_q_T(yelmo)))
     copyto!(s.ieb, Array(perYear2perSecond.(_melt_int(yelmo) .* (RHO_I / RHO_W))))   # read as-is by ConstantMeltInput
 

@@ -118,7 +118,9 @@ const DT_SHAKTI_YR        = parse(Float64, DT_SHAKTI_HOURS) / (24.0 * 365.25)
 # Yelmo is advanced (and exchanges fields with Shakti) only every DT_YELMO_YR, not every Shakti
 # step: each YelmoMirror step! syncs every field both ways, and its ice state changes on that
 # timescale anyway. Shakti keeps stepping at DT_SHAKTI_HOURS in between.
-const DT_YELMO_YR         = parse(Float64, get(ENV, "DT_YELMO_YR", "0.1"))
+# Default 0.02 yr: the Shakti N -> Yelmo friction -> melt -> N loop is a 2-step cycle at 0.1 yr and
+# damped at 0.05 yr (GrIS16 from the K24 spin-up); at 0.02 yr it is gone without any relaxation of N.
+const DT_YELMO_YR         = parse(Float64, get(ENV, "DT_YELMO_YR", "0.02"))
 # Shakti linear solver: "cholesky" (CPU) or "cg_mf" (matrix-free Jacobi CG; with Shakti's CUDA
 # backend this was the fastest on ice-sheet grids, ~20x CPU Cholesky on Greenland 16 km).
 const SHAKTI_SOLVER       = get(ENV, "SHAKTI_SOLVER", "cholesky")

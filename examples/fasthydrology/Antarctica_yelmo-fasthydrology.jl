@@ -462,13 +462,28 @@ end
 (q, |grad phi|, phi0) stays as the step's full K24 update (`couple_step!`) left it; the geometry and
 rate factor the velocity solve uses are refreshed in place, as the inputs of that update were.
 Requires `yneff.method = -1` (set by `external_neff`). A no-op for models whose N does not respond to
-u_b, and for the Mirror backend (the Fortran hook lives in Yelmo's own driver)."""
+u_b. Julia backend: `yelmo.hooks.neff_from_ub`; Mirror backend: Fortran Yelmo's DIVA iteration calls back into
+Julia (`yelmo_set_neff_callback!`)."""
+const NEFF_CALLS = Ref(0)   # calls of the N hook (diagnostic)
 install_ub_hook!(coupling, yelmo) = nothing
 function install_ub_hook!(coupling::CoupledHydrology{<:SteadyStateSimulation{<:KazmierczakHydroModel}}, yelmo)
-    (K24_UB_HOOK && BACKEND == "yelmo") || return nothing
+    K24_UB_HOOK || return nothing
     sim = coupling.sim
     FastHydrology.N_responds_to_ub(sim.model) || return nothing
+    if BACKEND == "mirror"
+        # Fortran Yelmo calls this in every DIVA Picard iteration with the iteration's basal speed
+        # [m/yr] on aa-nodes and takes N [Pa] back (yelmo_set_neff_callback!). The geometry, rate
+        # factor and the routing are those of this step's `couple_step!`, which ran just before.
+        Yelmo.yelmo_set_neff_callback!(yelmo, function (N_eff, uxy_b)
+            NEFF_CALLS[] += 1
+            FastHydrology.N_from_ub!(sim.model, sim.grid, sim.state, perYear2perSecond.(uxy_b))
+            N_eff .= interior(sim.state.N, :, :, 1)
+            return nothing
+        end)
+        return nothing
+    end
     yelmo.hooks.neff_from_ub = function (N_eff, ux_b, uy_b)
+        NEFF_CALLS[] += 1
         uxy_b = yelmo.dyn.uxy_b   # scratch aa field: rebuilt by Yelmo's end-of-step diagnostics
         Yelmo.calc_magnitude_from_staggered!(uxy_b, ux_b, uy_b, yelmo.tpo.f_ice_dyn)
         sim.state.mask   .= _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd) .> 0

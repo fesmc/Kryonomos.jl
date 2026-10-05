@@ -24,8 +24,7 @@ end
 
 function main_cycles(outdir, dt, time_end)
     mkpath(outdir)
-    BACKEND == "yelmo" || error("the hook acts on the Julia backend; set FASTHYDRO_BACKEND=yelmo")
-    @info "K24 on Julia Yelmo" hook = K24_UB_HOOK sliding = K24_SLIDING dt time_end
+        @info "K24 on Yelmo ($BACKEND)" hook = K24_UB_HOOK sliding = K24_SLIDING dt time_end
 
     yelmo    = get(ENV, "WARM", "0") == "1" ? setup_warm() : setup_yelmo(; external_neff = true)
     coupling = CoupledHydrology(build_hydrology_sim_K24(yelmo))
@@ -51,12 +50,21 @@ function main_cycles(outdir, dt, time_end)
     for k in 1:nsteps
         t0 = time()
         step!(coupling, yelmo, k * dt, dt)
-        push!(iters, yelmo.dyn.scratch.ssa_iter_now[])
+        hasproperty(yelmo.dyn, :scratch) && push!(iters, yelmo.dyn.scratch.ssa_iter_now[])
         save(k + 1)
-        @info "step $k  t=$(round(yelmo.time; digits = 3)) yr  Picard iters $(iters[end])  $(round(time() - t0; digits = 1)) s"
+        if coupling.sim.model isa KazmierczakHydroModel   # is N the one of the step's final u_b? (routing held)
+            sim = coupling.sim
+            Nout = copy(interior(yelmo.dyn.N_eff, :, :, 1))
+            Nchk = copy(interior(FastHydrology.N_from_ub!(sim.model, sim.grid, sim.state,
+                       perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1))), :, :, 1))
+            gm = interior(yelmo.tpo.f_grnd, :, :, 1) .> 0.5
+            rel = abs.(Nout .- Nchk)[gm] ./ max.(abs.(Nchk[gm]), 1e3)
+            @info "  N(final u_b) consistency: cells off by >10%: $(count(>(0.1), rel)) of $(length(rel)), median rel $(round(median(rel); sigdigits = 2))"
+        end
+        @info "step $k  t=$(round(yelmo.time; digits = 3)) yr  hook calls $(NEFF_CALLS[])  Picard iters $(isempty(iters) ? "-" : iters[end])  $(round(time() - t0; digits = 1)) s"
     end
     close(ds)
-    @info "mean Picard iterations per step" mean(iters)
+    isempty(iters) || @info "mean Picard iterations per step" mean(iters)
 end
 
 main_cycles(ARGS[1], parse(Float64, get(ARGS, 2, "0.1")), parse(Float64, get(ARGS, 3, "2.0")))

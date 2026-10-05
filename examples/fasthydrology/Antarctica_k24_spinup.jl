@@ -34,7 +34,13 @@
 ##   SPIN_RUNDIR      run directory (required)
 ##   SPIN_HYDRO       k24 (default) | bucket (control: Yelmo's own N closure, same everything else)
 ##   SPIN_REF_DIR     reference yelmox run dir [~/yelmox/output/ismip7_ant/j32_ours]
-##   SPIN_T_END       [30000] yr;  SPIN_RESTART_DT [1000] yr;  SPIN_SNAP_DT [1000] yr
+##   SPIN_T_END       [30000] yr (model time);  SPIN_RESTART_DT [1000] yr;  SPIN_SNAP_DT [1000] yr
+##   SPIN_START       restart directory of an earlier spin-up (write_restart: yelmo_restart.nc + tf_corr.nc)
+##                    to continue from, at its own time; "" (default): the reference t = 0 bundle. The
+##                    optimisers follow the reference schedule (&opt *_time_end), so a continuation past
+##                    30 kyr is a free run with cb_ref and tf_corr held. Needs SPIN_ISOS=0.
+##   SPIN_ISOS        1 (default): isostasy + sea level as yelmox; 0: bed and sea level held at the start
+##                    state (the restarts written here hold no isostasy state)
 ##   YELMO_INPUT_DIR  input/ of the yelmo build libyelmo_c_api.so came from
 ##   YELMOX_CAPI_DIR  see yelmox_capi.jl
 ## plus the K24 knobs of Antarctica_yelmo-fasthydrology.jl (K24_KAPPA, K24_FRICTION, K24_SIGMAT, ...);
@@ -66,6 +72,10 @@ const SPIN_CB_INIT   = get(ENV, "SPIN_CB_INIT", "bundle")
 const SPIN_CF_REF    = get(ENV, "SPIN_CF_REF", "")
 const SPIN_THERM     = get(ENV, "SPIN_THERM", "enth")   # enth: enthalpy + capacity basal BC (default); temp: the reference run's ytherm as is (diagnostics)
 const SPIN_QB_METHOD = parse(Int, get(ENV, "SPIN_QB_METHOD", "1"))   # Yelmo frictional heat; 1 = faces (pairs with K24_FRICTION=faces)
+const SPIN_START     = get(ENV, "SPIN_START", "")
+const SPIN_ISOS      = get(ENV, "SPIN_ISOS", "1") != "0"
+isempty(SPIN_START) || SPIN_ISOS == false || error("SPIN_START needs SPIN_ISOS=0 (no isostasy state in the restarts)")
+isempty(SPIN_START) || SPIN_CB_INIT == "bundle" || error("SPIN_START continues the restart's own cb_ref: SPIN_CB_INIT must be bundle")
 
 fld(f)      = Array{Float64}(interior(f)[:, :, 1])
 setf!(f, A) = (interior(f)[:, :, 1] .= A; f)
@@ -99,7 +109,7 @@ function spinup_nml()
     for (g, k) in NML_OBSOLETE
         txt = _nml_del(txt, g, k)
     end
-    txt = _nml_set(txt, "yelmo", "restart", joinpath(REF_BUNDLE, "yelmo_restart.nc"))
+    txt = _nml_set(txt, "yelmo", "restart", joinpath(isempty(SPIN_START) ? REF_BUNDLE : SPIN_START, "yelmo_restart.nc"))
     txt = _nml_set(txt, "ydyn", "slide_T", false)
     txt = _nml_set(txt, "ycalv", "tau_ice_flt", 125e3)
     txt = _nml_set(txt, "ycalv", "tau_ice_grnd", 125e3)
@@ -229,10 +239,12 @@ end
 function couple_and_step!(y, dt, conv_we_ie, time_rel)
     nx, ny = size(fld(y.tpo.H_ice))
     t = y.time + dt
-    dzcorr = zeros(nx, ny); Yelmo.yelmo_get_var2D!(dzcorr, Vector{UInt8}("bnd_dzbdt_corr\0"), y.calias)
-    isos_update!(fld(y.tpo.H_ice), dzcorr, t, time_rel)
-    setf!(y.bnd.z_bed, isos_get_var2D!(zeros(nx, ny), "z_bed"))
-    setf!(y.bnd.z_sl,  isos_get_var2D!(zeros(nx, ny), "z_ss"))
+    if SPIN_ISOS
+        dzcorr = zeros(nx, ny); Yelmo.yelmo_get_var2D!(dzcorr, Vector{UInt8}("bnd_dzbdt_corr\0"), y.calias)
+        isos_update!(fld(y.tpo.H_ice), dzcorr, t, time_rel)
+        setf!(y.bnd.z_bed, isos_get_var2D!(zeros(nx, ny), "z_bed"))
+        setf!(y.bnd.z_sl,  isos_get_var2D!(zeros(nx, ny), "z_ss"))
+    end
     setf!(y.bnd.smb_ref, esm_get_var2D!(zeros(nx, ny), "smb") .* conv_we_ie .* 1e-3)   # mm w.e./yr -> m i.e./yr
     setf!(y.bnd.T_srf,   esm_get_var2D!(zeros(nx, ny), "tsrf"))
     setf!(y.bnd.bmb_shlf, marshelf_get_var2D!(zeros(nx, ny), "bmb_shlf"))
@@ -320,7 +332,8 @@ end
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-function main()
+"""Run directory, YelmoMirror, couplers, K24 and the initial cb_ref: everything up to the time loop."""
+function setup()
     nmlfile = prepare_rundir(SPIN_RUNDIR)
     cd(SPIN_RUNDIR)
     nml = parse_nml_file(nmlfile)
@@ -328,8 +341,11 @@ function main()
     @info "K24 spin-up" SPIN_HYDRO REF_DIR SPIN_RUNDIR T_END K24_FROZEN_BED K24_FROZEN_HYST SPIN_CB_INIT SPIN_CF_REF K24_KAPPA K24_KAPPA_BED K24_FRICTION K24_SIGMAT K24_KAMB86 K24_UB_HOOK K24_SLIDING K24_A_BASAL G_SOURCE opt = o
 
     p = YelmoMirrorParameters("k24spin")
-    y = YelmoMirror(p, 0.0; alias = "ylmo1", rundir = SPIN_RUNDIR, overwrite = true, nml_file = nmlfile)
-    init_state!(y, 0.0; thrm_method = "robin-cold")   # restart branch: the bundle's state
+    t0 = isempty(SPIN_START) ? 0.0 :
+         NCDataset(ds -> Float64(ds["time"][end]), joinpath(SPIN_START, "yelmo_restart.nc"))
+    y = YelmoMirror(p, t0; alias = "ylmo1", rundir = SPIN_RUNDIR, overwrite = true, nml_file = nmlfile)   # Fortran clock starts at t0
+    init_state!(y, t0; thrm_method = "robin-cold")   # restart branch: the bundle's (restart's) state
+    isapprox(y.time, t0; atol = 1e-6) || error("Yelmo time $(y.time) != start time $t0")
 
     H0 = fld(y.tpo.H_ice); nx, ny = size(H0)
     dx = abs(Float64(y.g.Δxᶜᵃᵃ))
@@ -352,14 +368,18 @@ function main()
     # classic restart branch: marine shelf (tf_corr from the bundle), isostasy + sea level, ESM forcing
     marshelf_init!(nmlfile, "marine_shelf", nx, ny, domain, grid_name, fld(y.bnd.regions), fld(y.bnd.basins),
                    axis_centered_m(nx, dx), axis_centered_m(ny, dx), dx)
-    tf0 = NCDataset(ds -> Array{Float64}(coalesce.(ds["tf_corr"][:, :, 1], 0.0)), joinpath(REF_BUNDLE, "marine_shelf.nc"))
+    tf0 = isempty(SPIN_START) ?
+        NCDataset(ds -> Array{Float64}(coalesce.(ds["tf_corr"][:, :, 1], 0.0)), joinpath(REF_BUNDLE, "marine_shelf.nc")) :
+        NCDataset(ds -> Array{Float64}(ds["tf_corr"][:, :]), joinpath(SPIN_START, "tf_corr.nc"))
     marshelf_set_var2D!(tf0, "tf_corr")
-    isos_init!(nmlfile, "isos", nx, ny, dx, dx, time_rel)
-    isos_init_state_restart!(REF_BUNDLE, fld(y.bnd.z_bed), H0, 0.0, time_rel)
     esm_init!(nmlfile, SPIN_RUNDIR, domain, grid_name, nx, ny)
-    setf!(y.bnd.z_bed, isos_get_var2D!(zeros(nx, ny), "z_bed"))
-    setf!(y.bnd.z_sl,  isos_get_var2D!(zeros(nx, ny), "z_ss"))
-    climate_and_marine!(y, 0.0, dx)
+    if SPIN_ISOS
+        isos_init!(nmlfile, "isos", nx, ny, dx, dx, time_rel)
+        isos_init_state_restart!(REF_BUNDLE, fld(y.bnd.z_bed), H0, 0.0, time_rel)
+        setf!(y.bnd.z_bed, isos_get_var2D!(zeros(nx, ny), "z_bed"))
+        setf!(y.bnd.z_sl,  isos_get_var2D!(zeros(nx, ny), "z_ss"))
+    end
+    climate_and_marine!(y, t0, dx)
     maximum(abs.(esm_get_var2D!(zeros(nx, ny), "Qd_ann"))) == 0.0 || @warn "esm Qd_ann is non-zero (subglacial discharge is not coupled here)"
 
     if SPIN_HYDRO == "k24" && K24_KAPPA_BED == "pd"
@@ -393,6 +413,11 @@ function main()
         @info "initial cb_ref rescaled" SPIN_CB_INIT median_factor = median(fac[gr]) p90_factor = quantile(fac[gr], 0.9) cb_med = median(cb_new[gr]) n_at_cap = count(cb_new[gr] .>= o.cf_max) n_at_floor = count(cb_new[gr] .<= o.cf_min)
     end
 
+    return (; y, o, coupling, dx, dtt, conv_we_ie, time_rel, t0)
+end
+
+function main()
+    (; y, o, coupling, dx, dtt, conv_we_ie, time_rel, t0) = setup()
     tsfile = joinpath(SPIN_RUNDIR, "spinup_ts.tsv")
     open(tsfile, "w") do io; println(io, join(TS_COLS, '\t')); end
     snapfile = joinpath(SPIN_RUNDIR, "spinup_2D.nc")
@@ -401,9 +426,9 @@ function main()
     open(tsfile, "a") do io; println(io, join(row, '\t')); end
     snapshot!(snapfile, y, coupling)
 
-    nsteps = round(Int, T_END / dtt)
+    nsteps = round(Int, (T_END - t0) / dtt)
     for n in 1:nsteps
-        t = n * dtt
+        t = t0 + n * dtt
         hook0 = NEFF_TIME[]
         s_opt = @elapsed step_optimize!(y, o, t, dtt, dx)
         s_k24 = @elapsed (coupling isa CoupledHydrology && couple_step!(coupling.sim.model, coupling.sim, y, dtt))
@@ -429,4 +454,4 @@ function main()
     return y
 end
 
-main()
+get(ENV, "SPIN_NO_MAIN", "0") == "1" || main()

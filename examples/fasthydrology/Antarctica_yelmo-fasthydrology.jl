@@ -84,6 +84,19 @@ const BMB_SHLF_CONST = -0.5   # [m/yr]
 
 """Heat conducted from the bed into the ice [W/m^2] (Yelmo's Q_ice_b, mW/m^2)."""
 _q_T(yelmo) = interior(yelmo.thrm.Q_ice_b, :, :, 1) .* 1e-3
+# Under-relaxation of the q_T K24 receives (K24_RELAX_QT = omega in (0, 1]; 1: off). q_T is lagged one
+# coupling step and, under the capacity basal BC, carries the latent heat of the freeze-on Yelmo did with
+# K24's previous water: K24 reads it as basal cooling and freezes its water away, Yelmo then has none to
+# freeze, q_T drops, the water returns -- a period-2 oscillation (gain ~1) at cold-bed cells fed by a
+# trickle. q_T <- q_T + omega (Q_ice_b - q_T) damps it (omega = 0.5 removes the period-2 mode in one step)
+# and leaves the fixed point unchanged.
+const K24_RELAX_QT = parse(Float64, get(ENV, "K24_RELAX_QT", "1.0"))
+const K24_QT_PREV  = Ref{Union{Nothing, Matrix{Float64}}}(nothing)
+function _q_T_relaxed(yelmo)
+    qT = Float64.(_q_T(yelmo))
+    (K24_RELAX_QT >= 1 || K24_QT_PREV[] === nothing) && return (K24_QT_PREV[] = qT)
+    return (K24_QT_PREV[] = K24_QT_PREV[] .+ K24_RELAX_QT .* (qT .- K24_QT_PREV[]))
+end
 # Heat from below [W/m^2] for the hydrology's melt balance: the flux at the top of Yelmo's bedrock
 # column (Q_rock), which is what Yelmo's own basal balance uses -- not Q_geo at depth, which differs
 # while the bedrock is still warming. With Q_geo, L*mdot = G + Q_b + Q_wat - q_T is off from Yelmo's
@@ -500,7 +513,7 @@ function build_hydrology_sim_K24(yelmo)
     A_visc  = _A_visc(yelmo)   # basal (or depth-averaged) rate factor, see K24_A_BASAL
     # Water source from terms [W/m^2] and water from above [kg/m^2/s] (see _q_T/_melt_int).
     G       = _G(yelmo)
-    q_T     = _q_T(yelmo)
+    q_T     = _q_T_relaxed(yelmo)
     i_eb    = perYear2perSecond.(_melt_int(yelmo) .* RHO_I)
     kappa   = T.(_kappa(yelmo))   # bed hardness (0: hard, 1: soft), see K24_KAPPA
 
@@ -526,7 +539,7 @@ function Yelmo_to_FastHydrology_K24!(sim, yelmo)
     sim.state.b       .= interior(yelmo.bnd.z_bed, :, :, 1)
     sim.model.abs_v_b .= perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1))
     sim.model.A_visc  .= _A_visc(yelmo)
-    set_basal_terms!(sim.model; G = _G(yelmo), q_T = _q_T(yelmo),
+    set_basal_terms!(sim.model; G = _G(yelmo), q_T = _q_T_relaxed(yelmo),
                      i_eb = perYear2perSecond.(_melt_int(yelmo) .* RHO_I))
     K24_KAPPA_BED == "now" && (sim.model.kappa .= _kappa(yelmo))
     if sim.model.friction_discretization isa StaggeredFriction   # this step's face velocities

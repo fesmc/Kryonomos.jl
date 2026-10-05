@@ -409,6 +409,11 @@ K24_SLIDING in ("field", "none") || error("K24_SLIDING must be 'field' or 'none'
 # (default) Yelmo's DIVA iteration re-evaluates N from each iteration's u_b through
 # `yelmo.hooks.neff_from_ub` (FastHydrology.N_from_ub!, routing held from the step's full K24 update),
 # so N and u_b converge together. 0 restores the once-per-step N. Julia backend only.
+# Rate factor K24 sees: the basal layer (Fortran Yelmo's choice, mat%now%ATT(:,:,1)) with K24_A_BASAL=1 (default),
+# or the depth average (earlier behaviour) with 0. N_inf scales with A_glen^(-1/n), and the basal layer of a
+# warm base is far softer than the depth mean.
+const K24_A_BASAL = get(ENV, "K24_A_BASAL", "1") != "0"
+_A_visc(yelmo) = perYear2perSecond.(K24_A_BASAL ? interior(yelmo.mat.ATT)[:, :, 1] : mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1])
 const K24_UB_HOOK = get(ENV, "K24_UB_HOOK", "1") != "0"
 
 """Build a FastHydrology SteadyStateSimulation wrapping KazmierczakHydroModel, from `yelmo`'s current fields."""
@@ -424,7 +429,7 @@ function build_hydrology_sim_K24(yelmo)
     h       = interior(yelmo.tpo.H_ice,  :, :, 1)   # ice thickness
     b       = interior(yelmo.bnd.z_bed,  :, :, 1)   # bedrock elevation
     abs_v_b = perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1))              # basal speed
-    A_visc  = perYear2perSecond.(mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1])  # depth-averaged rate factor
+    A_visc  = _A_visc(yelmo)   # basal (or depth-averaged) rate factor, see K24_A_BASAL
     # Water source from terms [W/m^2] and water from above [kg/m^2/s] (see _q_T/_melt_int).
     G       = _G(yelmo)
     q_T     = _q_T(yelmo)
@@ -450,7 +455,7 @@ function Yelmo_to_FastHydrology_K24!(sim, yelmo)
     sim.state.h       .= interior(yelmo.tpo.H_ice, :, :, 1)
     sim.state.b       .= interior(yelmo.bnd.z_bed, :, :, 1)
     sim.model.abs_v_b .= perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1))
-    sim.model.A_visc  .= perYear2perSecond.(mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1])
+    sim.model.A_visc  .= _A_visc(yelmo)
     set_basal_terms!(sim.model; G = _G(yelmo), q_T = _q_T(yelmo),
                      i_eb = perYear2perSecond.(_melt_int(yelmo) .* RHO_I))
     fill!(sim.model.kappa, 0)
@@ -465,6 +470,7 @@ Requires `yneff.method = -1` (set by `external_neff`). A no-op for models whose 
 u_b. Julia backend: `yelmo.hooks.neff_from_ub`; Mirror backend: Fortran Yelmo's DIVA iteration calls back into
 Julia (`yelmo_set_neff_callback!`)."""
 const NEFF_CALLS = Ref(0)   # calls of the N hook (diagnostic)
+const NEFF_IN = Ref{Any}(nothing)   # N the first call of a step received (diagnostic)
 install_ub_hook!(coupling, yelmo) = nothing
 function install_ub_hook!(coupling::CoupledHydrology{<:SteadyStateSimulation{<:KazmierczakHydroModel}}, yelmo)
     K24_UB_HOOK || return nothing
@@ -476,6 +482,7 @@ function install_ub_hook!(coupling::CoupledHydrology{<:SteadyStateSimulation{<:K
         # factor and the routing are those of this step's `couple_step!`, which ran just before.
         Yelmo.yelmo_set_neff_callback!(yelmo, function (N_eff, uxy_b)
             NEFF_CALLS[] += 1
+            NEFF_IN[] === nothing && (NEFF_IN[] = copy(N_eff))
             FastHydrology.N_from_ub!(sim.model, sim.grid, sim.state, perYear2perSecond.(uxy_b))
             N_eff .= interior(sim.state.N, :, :, 1)
             return nothing
@@ -488,7 +495,7 @@ function install_ub_hook!(coupling::CoupledHydrology{<:SteadyStateSimulation{<:K
         Yelmo.calc_magnitude_from_staggered!(uxy_b, ux_b, uy_b, yelmo.tpo.f_ice_dyn)
         sim.state.mask   .= _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd) .> 0
         sim.state.h      .= interior(yelmo.tpo.H_ice, :, :, 1)
-        sim.model.A_visc .= perYear2perSecond.(mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1])
+        sim.model.A_visc .= _A_visc(yelmo)
         FastHydrology.N_from_ub!(sim.model, sim.grid, sim.state, perYear2perSecond.(interior(uxy_b, :, :, 1)))
         interior(N_eff, :, :, 1) .= sim.state.N
         return nothing

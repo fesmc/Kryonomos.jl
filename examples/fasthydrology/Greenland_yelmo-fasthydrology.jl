@@ -126,6 +126,7 @@ const TIME_END_SHAKTI_YR  = parse(Float64, TIME_END_SHAKTI_DAYS) / 365.25
 # K24/HAB have no FROZEN_BED concept, so this is ignored on those branches even if set.
 const FROZEN_BED_THRESHOLD  = (v = get(ENV, "FROZEN_BED_THRESHOLD", "none"); v == "none" ? nothing : parse(Float64, v)) # K of T_prime_b, e.g. -1.0 (Yelmo bmb cutoff) to opt in
 const FROZEN_BED_HYSTERESIS = 0.5     # K; thaw threshold = FROZEN_BED_THRESHOLD + this (0 => no hysteresis)
+const CAVITY_FILLING = get(ENV, "CAVITY_FILLING", "filled")   # "unfilled": Shakti.UnfilledCavities (free-surface regime, p_w >= 0, see Shakti's unfilled_cavities.jl); "filled": the original equations
 
 # ── Backend selection ────────────────────────────────────────────────────────
 # "yelmo" (default) — pure-Julia YelmoModel, as this script has always run.
@@ -630,7 +631,8 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
     # tsteps is inert here: it only matters for Shakti.run!'s own loop/observer bookkeeping, and
     # this coupling drives Shakti with FastHydrology.step! (see couple_step! below), not run!.
     dt_seconds = dt_yr * FastHydrology.SECONDS_PER_YEAR
-    shakti_sim = Shakti.Simulation(grid, state, 1, dt_seconds, p, "implicit", String[], mi, sl; ps = ps)
+    shakti_sim = Shakti.Simulation(grid, state, 1, dt_seconds, p, "implicit", String[], mi, sl; ps = ps,
+        cavity_filling = CAVITY_FILLING == "unfilled" ? Shakti.UnfilledCavities() : Shakti.FilledCavities())
 
     model = ShaktiHydroModel(shakti_sim)
     return TimeSimulation(model)
@@ -693,7 +695,7 @@ arrays are plain (Nx, Ny) arrays (unlike K24/HAB's Oceananigans fields), hence w
 function FastHydrology_to_Yelmo_Shakti!(yelmo, shakti_sim;
         dt_host = max(shakti_sim.dt[], yelmo.p.yelmo.dt_min * FastHydrology.SECONDS_PER_YEAR))
     interior(yelmo.dyn.N_eff, :, :, 1) .= Array(shakti_sim.state.N)
-    interior(yelmo.thrm.H_w,  :, :, 1) .= Array(shakti_sim.state.b)   # gap height stands in for water-layer thickness
+    interior(yelmo.thrm.H_w,  :, :, 1) .= Array(shakti_sim.state.b) .- (hasproperty(shakti_sim.state, :b_empty) ? Array(shakti_sim.state.b_empty) : 0.0)   # water actually in the gap (gap height less its empty part, Shakti.UnfilledCavities; b_empty = 0 otherwise) stands in for water-layer thickness
     # capacity for the next gap update, from this step's b, N and |u_b| (Shakti.freeze_on_capacity!)
     # The gap room is a stock available once per Yelmo step (dt_host [s], the coming Yelmo step),
     # while Shakti subcycles in hours, so it is spread over the Yelmo step.

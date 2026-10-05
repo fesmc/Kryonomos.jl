@@ -8,12 +8,26 @@
 ENV["KRYO_NO_MAIN"] = "1"
 include(joinpath(@__DIR__, "Greenland_yelmo-fasthydrology.jl"))
 
+# WARM=1: start from the ISMIP7 15 kyr GRL-16KM spin-up restart (optimised friction, spun-up
+# temperature) instead of the cold InitMIP start. Parameters from the ISMIP7 namelist as the Julia
+# structs read it; N_eff is set externally (yneff.method = -1) and cb_ref is kept from the restart.
+function setup_warm()
+    p = YelmoParameters(YELMO_NML_ISMIP7, "Greenland")
+    p = _override_field(p, :yneff, _override_field(p.yneff, :method, -1))
+    mkpath(RUN_DIR)
+    yelmo = YelmoModel(ISMIP7_RESTART, 0.0; p, boundaries = :bounded, rundir = RUN_DIR, strict = false)
+    @info "warm start" restart = ISMIP7_RESTART ytill_method = p.ytill.method solver = p.ydyn.solver
+    Yelmo.update_diagnostics!(yelmo)
+    Yelmo.YelmoModelDyn.dyn_step!(yelmo, 0.0)
+    return yelmo
+end
+
 function main_cycles(outdir, dt, time_end)
     mkpath(outdir)
     BACKEND == "yelmo" || error("the hook acts on the Julia backend; set FASTHYDRO_BACKEND=yelmo")
     @info "K24 on Julia Yelmo" hook = K24_UB_HOOK sliding = K24_SLIDING dt time_end
 
-    yelmo    = setup_yelmo(; external_neff = true)
+    yelmo    = get(ENV, "WARM", "0") == "1" ? setup_warm() : setup_yelmo(; external_neff = true)
     coupling = CoupledHydrology(build_hydrology_sim_K24(yelmo))
     install_ub_hook!(coupling, yelmo)
     @info "hook installed" installed = (yelmo.hooks.neff_from_ub !== nothing)

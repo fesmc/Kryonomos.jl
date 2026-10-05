@@ -305,7 +305,7 @@ function mirror_nml_ismip7(; external_neff::Bool, restart = get(ENV, "YELMO_REST
     if get(ENV, "YELMO_THERM", "enth") == "enth"
         txt = _nml_set(txt, "ytherm", "method", "enth")
         txt = _nml_set(txt, "ytherm", "basal_bc_method", "capacity")
-        txt = _nml_set(txt, "ytherm", "cap_source", external_neff && get(ENV, "K24_CAP", "hyd") == "hyd" ? "hyd" : "till")   # K24_CAP=till: Yelmo's own capacity even when coupled
+        txt = _nml_set(txt, "ytherm", "cap_source", (external_neff && get(ENV, "K24_CAP", "hyd") == "hyd") || get(ENV, "K24_CAP", "") == "fort" ? "hyd" : "till")   # K24_CAP=till: Yelmo's own capacity even when coupled
     end
     external_neff && (txt = _nml_set(txt, "yhyd", "bkt_N_closure", -1))
     if get(ENV, "YELMO_YHYD_K24", "0") == "1"   # K24 inside Fortran Yelmo (sliding law 4), as the yelmox spin-up ran it

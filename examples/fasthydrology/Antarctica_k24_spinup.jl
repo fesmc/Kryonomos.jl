@@ -354,7 +354,7 @@ function setup()
     H0 = fld(y.tpo.H_ice); nx, ny = size(H0)
     dx = abs(Float64(y.g.Δxᶜᵃᵃ))
     domain, grid_name = nmlstr(nml, "yelmo", "domain"), nmlstr(nml, "yelmo", "grid_name")
-    dtt = nmlflt(nml, "spinup", "dtt")
+    dtt = haskey(ENV, "SPIN_DTT") ? parse(Float64, ENV["SPIN_DTT"]) : nmlflt(nml, "spinup", "dtt")   # SPIN_DTT [yr] overrides the coupling step
     time_rel = nmlflt(nml, "spinup", "tstep_const") - 2000.0   # yelmox timeline_init(time_ref = 2000), "const"
     nmlbool(nml, "coupling", "lim_pd_ice") && error("lim_pd_ice = True is not wrapped")
     @info "grid" domain grid_name nx ny dx dtt time_rel

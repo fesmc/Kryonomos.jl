@@ -108,6 +108,16 @@ end
 # it freezes in the same step. The latent heat in their lagged q_T is then irrelevant to K24.
 const K24_COLD_ABSORB = (v = get(ENV, "K24_COLD_ABSORB", "none"); v == "none" ? nothing : parse(Float64, v))
 const K24_ABSORB_QT   = 1.0e3   # [W/m^2] excess of q_T over G at absorbing cells (~100 m/yr of freezing)
+# Yelmo's own cold-base test (ytherm cap_cold_tol, 0.01 K). With K24_COLD_ABSORB above it, the slightly cold cells
+# in between (-K24_COLD_ABSORB <= T'_b < -YELMO_COLD_TOL; sub-grid temperate patches) pass their water on: K24 routes
+# it through, and Yelmo is handed no capacity there (C_frz = 0), so its flux branch freezes nothing and no water is
+# removed twice. Freeze-on still happens once, in the step the water arrives, at the clearly cold cells.
+const YELMO_COLD_TOL = 0.01
+function _pass_through_cells(yelmo)
+    (K24_COLD_ABSORB === nothing || K24_COLD_ABSORB <= YELMO_COLD_TOL) && return nothing
+    T = interior(yelmo.thrm.T_prime_b, :, :, 1)
+    return (T .< -YELMO_COLD_TOL) .& (T .>= -K24_COLD_ABSORB)
+end
 function _q_T_k24(yelmo)
     qT = _q_T_relaxed(yelmo)
     K24_COLD_ABSORB === nothing && return qT
@@ -651,6 +661,8 @@ function FastHydrology_to_Yelmo_K24!(yelmo, sim)
     _post_N!(view(interior(yelmo.dyn.N_eff), :, :, 1), yelmo, sim)   # dry frozen bed, wetness blend, time relaxation
     yelmo.thrm.H_w  .= sim.state.W   # subglacial water thickness
     C_frz = FastHydrology.freeze_on_capacity!(zeros(size(interior(yelmo.dyn.N_eff, :, :, 1))), sim.model, sim.grid, sim.state)
+    pass = _pass_through_cells(yelmo)
+    pass === nothing || (C_frz[pass] .= 0)
     _push_exchange!(yelmo; C_frz = C_frz, Q_diss = Array(interior(sim.model.Q_diss, :, :, 1)))
 end
 

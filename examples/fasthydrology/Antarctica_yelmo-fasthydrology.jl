@@ -496,6 +496,37 @@ function _frozen_N!(N::AbstractMatrix, yelmo)
     return N
 end
 
+# Two optional treatments of the N K24 hands Yelmo (both off by default), applied after the frozen-bed
+# override wherever N is pushed (full update and DIVA callback):
+#  - K24_W_SAT [m] > 0: wetness blend N = Po - (Po - N_K24) min(1, W / K24_W_SAT). K24's hard-bed N drops
+#    from overburden to ~N_K24 for any trickle (N_inf ~ Q^-0.27), a near-switch at a cell's wet/dry edge;
+#    the blend makes N continuous in the water thickness, as a till-saturation closure does.
+#  - K24_TAU_N [yr] > 0: implicit time relaxation N = N_prev + a (N_K24 - N_prev), a = dt / (tau + dt),
+#    N_prev the N Yelmo used over the previous coupling step. Filters the coupling-step flicker of K24 N
+#    (cold-bed cells fed by a trickle switch wet/dry with the lagged freeze-on exchange). Active once the
+#    host sets K24_RELAX_N_ON[] = true (after any start-up use of the raw K24 N).
+const K24_W_SAT      = parse(Float64, get(ENV, "K24_W_SAT", "0.0"))
+const K24_TAU_N      = parse(Float64, get(ENV, "K24_TAU_N", "0.0"))
+const K24_RELAX_N_ON = Ref(false)
+const K24_N_PREV     = Ref{Union{Nothing, Matrix{Float64}}}(nothing)
+const K24_DT         = Ref(NaN)
+function _post_N!(N::AbstractMatrix, yelmo, sim)
+    _frozen_N!(N, yelmo)
+    if K24_W_SAT > 0
+        H = interior(yelmo.tpo.H_ice, :, :, 1); W = interior(sim.state.W, :, :, 1); g = _grounded(yelmo)
+        @inbounds for I in eachindex(N)
+            g[I] || continue
+            Po = RHO_I * 9.81 * H[I]
+            N[I] = Po - (Po - N[I]) * min(1.0, W[I] / K24_W_SAT)
+        end
+    end
+    if K24_TAU_N > 0 && K24_RELAX_N_ON[] && K24_N_PREV[] !== nothing && isfinite(K24_DT[])
+        a = K24_DT[] / (K24_TAU_N + K24_DT[])
+        @. N = K24_N_PREV[] + a * (N - K24_N_PREV[])
+    end
+    return N
+end
+
 """Build a FastHydrology SteadyStateSimulation wrapping KazmierczakHydroModel, from `yelmo`'s current fields."""
 function build_hydrology_sim_K24(yelmo)
 
@@ -575,7 +606,7 @@ function install_ub_hook!(coupling::CoupledHydrology{<:SteadyStateSimulation{<:K
             NEFF_IN[] === nothing && (NEFF_IN[] = copy(N_eff))
             FastHydrology.N_from_ub!(sim.model, sim.grid, sim.state, perYear2perSecond.(uxy_b))
             N_eff .= interior(sim.state.N, :, :, 1)
-            _frozen_N!(N_eff, yelmo)
+            _post_N!(N_eff, yelmo, sim)
             NEFF_TIME[] += time() - t0
             return nothing
         end)
@@ -590,7 +621,7 @@ function install_ub_hook!(coupling::CoupledHydrology{<:SteadyStateSimulation{<:K
         sim.model.A_visc .= _A_visc(yelmo)
         FastHydrology.N_from_ub!(sim.model, sim.grid, sim.state, perYear2perSecond.(interior(uxy_b, :, :, 1)))
         interior(N_eff, :, :, 1) .= sim.state.N
-        _frozen_N!(view(interior(N_eff), :, :, 1), yelmo)
+        _post_N!(view(interior(N_eff), :, :, 1), yelmo, sim)
         return nothing
     end
     return nothing
@@ -599,7 +630,7 @@ end
 """Copy FastHydrology outputs → Yelmo boundary fields (K24)."""
 function FastHydrology_to_Yelmo_K24!(yelmo, sim)
     yelmo.dyn.N_eff .= sim.state.N   # effective pressure
-    _frozen_N!(view(interior(yelmo.dyn.N_eff), :, :, 1), yelmo)   # dry frozen bed, see K24_FROZEN_BED
+    _post_N!(view(interior(yelmo.dyn.N_eff), :, :, 1), yelmo, sim)   # dry frozen bed, wetness blend, time relaxation
     yelmo.thrm.H_w  .= sim.state.W   # subglacial water thickness
     C_frz = FastHydrology.freeze_on_capacity!(zeros(size(interior(yelmo.dyn.N_eff, :, :, 1))), sim.model, sim.grid, sim.state)
     _push_exchange!(yelmo; C_frz = C_frz, Q_diss = Array(interior(sim.model.Q_diss, :, :, 1)))
@@ -819,6 +850,8 @@ whichever FastHydrology model is active in `sim`. `frozen_bed_threshold` (see
 [`FROZEN_BED_THRESHOLD`](@ref)) is accepted by every method for a uniform call site in `step!`
 below, but only the Shakti method does anything with it -- K24/HAB have no FROZEN_BED concept."""
 function couple_step!(::KazmierczakHydroModel, sim, yelmo, dt; frozen_bed_threshold = nothing)
+    K24_DT[] = dt
+    K24_N_PREV[] = Array{Float64}(interior(yelmo.dyn.N_eff, :, :, 1))   # the N Yelmo used last step (see K24_TAU_N)
     Yelmo_to_FastHydrology_K24!(sim, yelmo)
     FastHydrology.run!(sim)
     FastHydrology_to_Yelmo_K24!(yelmo, sim)

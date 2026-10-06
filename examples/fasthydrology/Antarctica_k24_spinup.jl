@@ -338,7 +338,7 @@ function setup()
     cd(SPIN_RUNDIR)
     nml = parse_nml_file(nmlfile)
     o = load_opt(nml)
-    @info "K24 spin-up" SPIN_HYDRO REF_DIR SPIN_RUNDIR T_END K24_FROZEN_BED K24_FROZEN_HYST SPIN_CB_INIT SPIN_CF_REF K24_KAPPA K24_KAPPA_BED K24_FRICTION K24_SIGMAT K24_KAMB86 K24_UB_HOOK K24_SLIDING K24_A_BASAL G_SOURCE opt = o
+    @info "K24 spin-up" SPIN_HYDRO REF_DIR SPIN_RUNDIR T_END K24_RELAX_QT K24_TAU_N K24_W_SAT K24_FROZEN_BED K24_FROZEN_HYST SPIN_CB_INIT SPIN_CF_REF K24_KAPPA K24_KAPPA_BED K24_FRICTION K24_SIGMAT K24_KAMB86 K24_UB_HOOK K24_SLIDING K24_A_BASAL G_SOURCE opt = o
 
     p = YelmoMirrorParameters("k24spin")
     t0 = isempty(SPIN_START) ? 0.0 :
@@ -418,6 +418,7 @@ end
 
 function main()
     (; y, o, coupling, dx, dtt, conv_we_ie, time_rel, t0) = setup()
+    K24_RELAX_N_ON[] = true   # K24_TAU_N relaxation from the first loop step (the start-up N above is K24's own)
     tsfile = joinpath(SPIN_RUNDIR, "spinup_ts.tsv")
     open(tsfile, "w") do io; println(io, join(TS_COLS, '\t')); end
     snapfile = joinpath(SPIN_RUNDIR, "spinup_2D.nc")

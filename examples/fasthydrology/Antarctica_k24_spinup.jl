@@ -123,6 +123,12 @@ function spinup_nml()
     txt = _nml_set(txt, "ytherm", "qb_method", SPIN_QB_METHOD)
     SPIN_HYDRO == "k24" && (txt = _nml_set(txt, "yhyd", "bkt_N_closure", -1))
     isempty(SPIN_CF_REF) || (txt = _nml_set(txt, "ytill", "cf_ref", parse(Float64, SPIN_CF_REF)))
+    # SPIN_NML_SET = "group.key=value,group.key=value": generic namelist overrides, applied last
+    for item in filter(!isempty, strip.(split(get(ENV, "SPIN_NML_SET", ""), ",")))
+        gk, v = strip.(split(item, "=", limit = 2)); g, k = split(gk, ".", limit = 2)
+        val = something(tryparse(Int, v), tryparse(Float64, v), v)
+        txt = _nml_set(txt, String(g), String(k), val)
+    end
     return txt
 end
 
@@ -402,10 +408,19 @@ function setup()
     if SPIN_CB_INIT != "bundle"
         cb = fld(y.dyn.cb_ref); gr = (fld(y.tpo.f_grnd) .> 0.5) .& (fld(y.tpo.H_ice) .> 0)
         if SPIN_CB_INIT == "match"
-            SPIN_HYDRO == "k24" || error("SPIN_CB_INIT=match needs SPIN_HYDRO=k24")
             N_ref = fld(y.dyn.N_eff)   # the reference closure's N in the start bundle
-            couple_step!(coupling.sim.model, coupling.sim, y, dtt)   # K24 N on the start state (pushed again in step 1)
-            N_k24 = fld(y.dyn.N_eff)
+            if SPIN_HYDRO == "k24"
+                couple_step!(coupling.sim.model, coupling.sim, y, dtt)   # K24 N on the start state (pushed again in step 1)
+                N_k24 = fld(y.dyn.N_eff)
+            else
+                # bucket with the till closure (yhyd.bkt_N_closure = 3, van Pelt & Bueler 2015) on the start bundle's till water
+                Int(nmlflt(nml, "yhyd", "bkt_N_closure")) == 3 || error("SPIN_CB_INIT=match with the bucket needs yhyd.bkt_N_closure = 3")
+                W = NCDataset(ds -> Float64.(coalesce.(ds["hyd_W_til"][:, :], 0.0)), joinpath(REF_BUNDLE, "yelmo_restart.nc"))
+                N0 = nmlflt(nml, "yhyd", "till_N0"); dl = nmlflt(nml, "yhyd", "till_delta")
+                e0 = nmlflt(nml, "yhyd", "till_e0"); Cc = nmlflt(nml, "yhyd", "till_Cc"); Wm = nmlflt(nml, "yhyd", "W_til_max")
+                P0 = 910.0 * 9.81 .* fld(y.tpo.H_ice); sv = min.(W ./ Wm, 1.0)
+                N_k24 = min.(N0 .* (dl .* P0 ./ N0) .^ sv .* 10.0 .^ min.((e0 / Cc) .* (1 .- sv), 10.0), P0)
+            end
             fac = ifelse.(gr .& (N_k24 .> 0) .& (N_ref .> 0), N_ref ./ max.(N_k24, 1.0), 1.0)
         elseif startswith(SPIN_CB_INIT, "scale")
             fac = fill(parse(Float64, SPIN_CB_INIT[6:end]), size(cb))

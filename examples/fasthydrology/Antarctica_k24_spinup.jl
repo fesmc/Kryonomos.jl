@@ -35,6 +35,7 @@
 ##   SPIN_HYDRO       k24 (default) | bucket (control: Yelmo's own N closure, same everything else)
 ##   SPIN_REF_DIR     reference yelmox run dir [~/yelmox/output/ismip7_ant/j32_ours]
 ##   SPIN_T_END       [30000] yr (model time);  SPIN_RESTART_DT [1000] yr;  SPIN_SNAP_DT [1000] yr
+##   SPIN_OPT_T_END   [nml cf/tf_time_end] yr: keep the cb_ref / tf_corr optimisers on until this time
 ##   SPIN_START       restart directory of an earlier spin-up (write_restart: yelmo_restart.nc + tf_corr.nc)
 ##                    to continue from, at its own time; "" (default): the reference t = 0 bundle. The
 ##                    optimisers follow the reference schedule (&opt *_time_end), so a continuation past
@@ -167,12 +168,15 @@ struct OptPars
     rel_time2::Float64
 end
 
+# SPIN_OPT_T_END overrides the nml cf/tf_time_end, e.g. to keep optimising in a continuation past 30 kyr
+_opt_t_end(t_nml) = haskey(ENV, "SPIN_OPT_T_END") ? parse(Float64, ENV["SPIN_OPT_T_END"]) : t_nml
+
 # yelmox domain_opt_init: the cb_ref bounds are Yelmo's till_cf_min / till_cf_ref
 load_opt(nml) = OptPars(
-    nmlbool(nml, "opt", "opt_cf"), nmlflt(nml, "opt", "cf_time_init"), nmlflt(nml, "opt", "cf_time_end"),
+    nmlbool(nml, "opt", "opt_cf"), nmlflt(nml, "opt", "cf_time_init"), _opt_t_end(nmlflt(nml, "opt", "cf_time_end")),
     nmlflt(nml, "opt", "tau_c"), nmlflt(nml, "opt", "H0"), nmlstr(nml, "opt", "fill_method"),
     nmlflt(nml, "ytill", "cf_min"), nmlflt(nml, "ytill", "cf_ref"),
-    nmlbool(nml, "opt", "opt_tf"), nmlflt(nml, "opt", "tf_time_init"), nmlflt(nml, "opt", "tf_time_end"),
+    nmlbool(nml, "opt", "opt_tf"), nmlflt(nml, "opt", "tf_time_init"), _opt_t_end(nmlflt(nml, "opt", "tf_time_end")),
     nmlflt(nml, "opt", "H_grnd_lim"), nmlflt(nml, "opt", "tau_m"), nmlflt(nml, "opt", "m_temp"),
     nmlflt(nml, "opt", "tf_min"), nmlflt(nml, "opt", "tf_max"), nmlints(nml, "opt", "tf_basins"),
     nmlflt(nml, "opt", "rel_time2"))

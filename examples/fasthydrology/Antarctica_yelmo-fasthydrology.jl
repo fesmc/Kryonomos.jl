@@ -118,7 +118,24 @@ function _pass_through_cells(yelmo)
     T = interior(yelmo.thrm.T_prime_b, :, :, 1)
     return (T .< -YELMO_COLD_TOL) .& (T .>= -K24_COLD_ABSORB)
 end
+# Demand-limited same-step freeze-on (K24_FREEZE_DEMAND=1; takes precedence over K24_COLD_ABSORB). Yelmo's
+# bmb_grnd_star is the freeze-on rate [m/yr ice, > 0 freezing] that would hold the base at T_pmp, from the start-of-step
+# temperature profile: the most water the base can refreeze before its latent heat warms it to melting. K24's q_T is
+# replaced by the conductive flux of that pmp-held base, q_T* = G + Q_b + Q_wat + rho_i L bmb_star (exactly Q_ice_b at
+# a base Yelmo holds at T_pmp; free of the latent heat a cold base released last step), so each cell's routing sink
+# is its freeze demand and K24 freezes min(inflow, demand) in this step. freeze_on_capacity! is capped at the same
+# demand, so Yelmo's capacity rule freezes exactly that water in the same step, whichever branch it takes, and a
+# cold base never takes more latent heat than warms it to T_pmp (absorb-all froze whole catchments in one cell).
+const K24_FREEZE_DEMAND = get(ENV, "K24_FREEZE_DEMAND", "0") != "0"
+const K24_QWAT_PREV     = Ref{Union{Nothing, Matrix{Float64}}}(nothing)   # water-side heat pushed to Yelmo last step [W/m^2]
+_bmb_star(yelmo) = Float64.(interior(yelmo.thrm.bmb_grnd_star, :, :, 1))   # [m/yr ice], > 0 freeze-on
+function _q_T_star(yelmo)
+    Qwat = K24_QWAT_PREV[] === nothing ? 0.0 : K24_QWAT_PREV[]
+    return _G(yelmo) .+ interior(yelmo.thrm.Q_b, :, :, 1) .* 1e-3 .+ Qwat .+
+           perYear2perSecond.(RHO_I * L_ICE .* _bmb_star(yelmo))
+end
 function _q_T_k24(yelmo)
+    K24_FREEZE_DEMAND && return ifelse.(_grounded(yelmo), _q_T_star(yelmo), Float64.(_q_T(yelmo)))
     qT = _q_T_relaxed(yelmo)
     K24_COLD_ABSORB === nothing && return qT
     cold = (interior(yelmo.thrm.T_prime_b, :, :, 1) .< -K24_COLD_ABSORB) .& _grounded(yelmo)
@@ -663,7 +680,10 @@ function FastHydrology_to_Yelmo_K24!(yelmo, sim)
     C_frz = FastHydrology.freeze_on_capacity!(zeros(size(interior(yelmo.dyn.N_eff, :, :, 1))), sim.model, sim.grid, sim.state)
     pass = _pass_through_cells(yelmo)
     pass === nothing || (C_frz[pass] .= 0)
-    _push_exchange!(yelmo; C_frz = C_frz, Q_diss = Array(interior(sim.model.Q_diss, :, :, 1)))
+    K24_FREEZE_DEMAND && (C_frz .= min.(C_frz, max.(perYear2perSecond.(_bmb_star(yelmo)), 0.0)))   # what K24 froze
+    Q_diss = Array{Float64}(interior(sim.model.Q_diss, :, :, 1))
+    K24_QWAT_PREV[] = Q_diss
+    _push_exchange!(yelmo; C_frz = C_frz, Q_diss = Q_diss)
 end
 
 # ── HAB (height above buoyancy): build + coupling functions ───────────────────

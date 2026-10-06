@@ -97,6 +97,24 @@ function _q_T_relaxed(yelmo)
     (K24_RELAX_QT >= 1 || K24_QT_PREV[] === nothing) && return (K24_QT_PREV[] = qT)
     return (K24_QT_PREV[] = K24_QT_PREV[] .+ K24_RELAX_QT .* (qT .- K24_QT_PREV[]))
 end
+# Same-step freeze-on at cold bases (K24_COLD_ABSORB = T'_b tolerance [K]; default none). Under the capacity
+# basal BC a base below T_pmp takes Yelmo's flux branch and freezes ALL the water routed into it (C_frz) in the
+# step it is offered, putting the latent heat into Q_ice_b. Without this option K24 learns of that freezing only
+# one step later, as a q_T sink, and removes the same water again from the next step's routing: a cold cell's
+# outflow becomes ~max(0, inflow_now - inflow_before), and trickle-fed cold-bed networks flip wet/dry every
+# coupling step. With it, the cells Yelmo will treat as cold this step (T'_b < -tol, its is_cold_base test)
+# absorb all their inflow in K24's routing (a sink no inflow can exceed, so psi_out clamps to 0: the cell and
+# everything it alone feeds are dry), and freeze_on_capacity! hands Yelmo exactly that absorbed inflow, which
+# it freezes in the same step. The latent heat in their lagged q_T is then irrelevant to K24.
+const K24_COLD_ABSORB = (v = get(ENV, "K24_COLD_ABSORB", "none"); v == "none" ? nothing : parse(Float64, v))
+const K24_ABSORB_QT   = 1.0e3   # [W/m^2] excess of q_T over G at absorbing cells (~100 m/yr of freezing)
+function _q_T_k24(yelmo)
+    qT = _q_T_relaxed(yelmo)
+    K24_COLD_ABSORB === nothing && return qT
+    cold = (interior(yelmo.thrm.T_prime_b, :, :, 1) .< -K24_COLD_ABSORB) .& _grounded(yelmo)
+    return ifelse.(cold, _G(yelmo) .+ K24_ABSORB_QT, qT)
+end
+
 # Heat from below [W/m^2] for the hydrology's melt balance: the flux at the top of Yelmo's bedrock
 # column (Q_rock), which is what Yelmo's own basal balance uses -- not Q_geo at depth, which differs
 # while the bedrock is still warming. With Q_geo, L*mdot = G + Q_b + Q_wat - q_T is off from Yelmo's
@@ -544,7 +562,7 @@ function build_hydrology_sim_K24(yelmo)
     A_visc  = _A_visc(yelmo)   # basal (or depth-averaged) rate factor, see K24_A_BASAL
     # Water source from terms [W/m^2] and water from above [kg/m^2/s] (see _q_T/_melt_int).
     G       = _G(yelmo)
-    q_T     = _q_T_relaxed(yelmo)
+    q_T     = _q_T_k24(yelmo)
     i_eb    = perYear2perSecond.(_melt_int(yelmo) .* RHO_I)
     kappa   = T.(_kappa(yelmo))   # bed hardness (0: hard, 1: soft), see K24_KAPPA
 
@@ -570,7 +588,7 @@ function Yelmo_to_FastHydrology_K24!(sim, yelmo)
     sim.state.b       .= interior(yelmo.bnd.z_bed, :, :, 1)
     sim.model.abs_v_b .= perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1))
     sim.model.A_visc  .= _A_visc(yelmo)
-    set_basal_terms!(sim.model; G = _G(yelmo), q_T = _q_T_relaxed(yelmo),
+    set_basal_terms!(sim.model; G = _G(yelmo), q_T = _q_T_k24(yelmo),
                      i_eb = perYear2perSecond.(_melt_int(yelmo) .* RHO_I))
     K24_KAPPA_BED == "now" && (sim.model.kappa .= _kappa(yelmo))
     if sim.model.friction_discretization isa StaggeredFriction   # this step's face velocities

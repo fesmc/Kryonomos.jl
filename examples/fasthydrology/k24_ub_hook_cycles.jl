@@ -62,22 +62,22 @@ function main_cycles(outdir, dt, time_end)
         if coupling isa CoupledHydrology && coupling.sim.model isa KazmierczakHydroModel   # is N the one of the step's final u_b? (routing held)
             sim = coupling.sim
             Nout = copy(interior(yelmo.dyn.N_eff, :, :, 1))
-            Nchk = copy(interior(FastHydrology.N_from_ub!(sim.model, sim.grid, sim.state,
-                       perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1))), :, :, 1))
+            Nchk = copy(FastHydrology.N_from_ub!(sim.model, sim.grid, sim.state,
+                       perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1))))
             gm = interior(yelmo.tpo.f_grnd, :, :, 1) .> 0.5
             rel = abs.(Nout .- Nchk)[gm] ./ max.(abs.(Nchk[gm]), 1e3)
             @info "  N(final u_b) consistency: cells off by >10%: $(count(>(0.1), rel)) of $(length(rel)), median rel $(round(median(rel); sigdigits = 2))"
             if get(ENV, "K24_DECOMPOSE", "0") == "1"   # what changes in the routing between consecutive full updates?
                 m = sim.model; L = FastHydrology.KAZMIERCZAK_DEFAULT_L_W
-                old = (fixed = copy(interior(m.mdot_fixed, :, :, 1)), Qb = copy(interior(m.Q_b, :, :, 1)),
-                       Qd = copy(interior(m.Q_diss, :, :, 1)), tot = copy(interior(m.mdot_total, :, :, 1)),
-                       q = copy(interior(m.q, :, :, 1)), ub = copy(interior(m.abs_v_b, :, :, 1)))
+                old = (fixed = copy(m.mdot_fixed), Qb = copy(m.Q_b),
+                       Qd = copy(m.Q_diss), tot = copy(m.mdot_total),
+                       q = copy(m.q), ub = copy(m.abs_v_b))
                 Yelmo_to_FastHydrology_K24!(sim, yelmo); FastHydrology.run!(sim)
-                Nfull = copy(interior(sim.state.N, :, :, 1))
+                Nfull = copy(sim.state.N)
                 bad = gm .& (abs.(Nfull .- Nchk) ./ max.(abs.(Nchk), 1e3) .> 0.1)
                 med(x) = isempty(x) ? NaN : round(median(x); sigdigits = 3)
-                nw = (fixed = interior(m.mdot_fixed, :, :, 1), Qb = interior(m.Q_b, :, :, 1), Qd = interior(m.Q_diss, :, :, 1),
-                      tot = interior(m.mdot_total, :, :, 1), q = interior(m.q, :, :, 1))
+                nw = (fixed = m.mdot_fixed, Qb = m.Q_b, Qd = m.Q_diss,
+                      tot = m.mdot_total, q = m.q)
                 @info "  decompose ($(count(bad)) cells where full-update N differs >10% from held-routing N), medians over them:" *
                       " mdot_total old/new $(med(old.tot[bad])) / $(med(nw.tot[bad]))" *
                       "  |dfixed|/|tot| $(med(abs.(nw.fixed[bad] .- old.fixed[bad]) ./ max.(abs.(nw.tot[bad]), 1e-14)))" *

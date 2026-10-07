@@ -317,12 +317,12 @@ function snapshot!(fn, y, coupling)
         ds["pd_uxy_s"][:, :, k] = fld(y.dta.pd_uxy_s)
         if coupling isa CoupledHydrology
             m, st = coupling.sim.model, coupling.sim.state
-            ds["k24_W"][:, :, k]      = interior(st.W, :, :, 1)
-            ds["k24_q"][:, :, k]      = interior(m.q, :, :, 1)
-            ds["k24_mdot"][:, :, k]   = interior(m.mdot_total, :, :, 1)
-            ds["k24_Q_b"][:, :, k]    = interior(m.Q_b, :, :, 1)
-            ds["k24_Q_diss"][:, :, k] = interior(m.Q_diss, :, :, 1)
-            ds["k24_kappa"][:, :, k]  = interior(m.kappa, :, :, 1)
+            ds["k24_W"][:, :, k]      = st.W
+            ds["k24_q"][:, :, k]      = m.q
+            ds["k24_mdot"][:, :, k]   = m.mdot_total
+            ds["k24_Q_b"][:, :, k]    = m.Q_b
+            ds["k24_Q_diss"][:, :, k] = m.Q_diss
+            ds["k24_kappa"][:, :, k]  = m.kappa
             ds["k24_frozen"][:, :, k] = K24_FROZEN[] === nothing ? zeros(nx, ny) : Float64.(K24_FROZEN[])
         end
     end

@@ -611,7 +611,7 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
     taub_x = interior(yelmo.dyn.taub_acx, :, :, 1)   # already in Pa, no time unit to convert
     taub_y = interior(yelmo.dyn.taub_acy, :, :, 1)
     G      = _G(yelmo)   # mW/m^2 -> W/m^2 - WARNING: this field might contain a -9999.0 fill sentinel
-    ieb    = perYear2perSecond.(_melt_int(yelmo) .* (RHO_I / RHO_W))   # englacial water drained to the bed [m/s water]
+    ieb    = zeros(size(G))   # Shakti's own input: none here (Yelmo's englacial drainage is ieb_external, below)
 
     # b_max = 1 m (ISSM SHAKTI default) caps the negative-N runaway: where N < 0 creep opens the gap,
     # and with no cap it grows without bound (Greenland 16 km coupled test: b -> 1e35 m at an edge cell).
@@ -638,6 +638,7 @@ function build_hydrology_sim_Shakti(yelmo, dt_yr)
     gap0  = ifelse.(interior(yelmo.thrm.T_prime_b, :, :, 1) .>= -0.1, 1e-3, p.b_min)
     state = Shakti.State(grid)
     Shakti.set_initial_conditions!(state, grid, p, sl, mask, A_visc, zb, zs, gap0, G, ub_x, ub_y, ieb, taub_x, taub_y)
+    Shakti.set_ieb_external!(state, perYear2perSecond.(_melt_int(yelmo) .* (RHO_I / RHO_W)))   # englacial water drained to the bed [m/s water], added to Shakti's own ieb
 
     ls = SHAKTI_SOLVER == "cg_mf"    ? Shakti.CGIterativeSolver(grid, Shakti.MatrixFreeLinearSystem) :
          SHAKTI_SOLVER == "cholesky" ? Shakti.CholeskyDirectSolver(grid) :
@@ -679,7 +680,7 @@ function Yelmo_to_FastHydrology_Shakti!(shakti_sim, yelmo)
     copyto!(s.taub_y, Array(interior(yelmo.dyn.taub_acy, :, :, 1)))
     copyto!(s.G, Array(_G(yelmo)))
     copyto!(s.q_T, Array(_q_T(yelmo)))
-    copyto!(s.ieb, Array(perYear2perSecond.(_melt_int(yelmo) .* (RHO_I / RHO_W))))   # read as-is by ConstantMeltInput
+    Shakti.set_ieb_external!(s, perYear2perSecond.(_melt_int(yelmo) .* (RHO_I / RHO_W)))   # Yelmo's englacial drainage, added to Shakti's own ieb
 
     Shakti.compute_H!(s)
     Shakti.compute_po!(s, shakti_sim.p)

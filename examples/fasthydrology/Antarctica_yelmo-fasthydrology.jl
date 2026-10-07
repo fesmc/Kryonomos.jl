@@ -235,8 +235,9 @@ const CAVITY_FILLING = get(ENV, "CAVITY_FILLING", "filled")   # "unfilled": Shak
 #                       Set FASTHYDRO_BACKEND=mirror to use this instead.
 #
 # Every coupling function below (Yelmo_to_FastHydrology_*!, FastHydrology_to_Yelmo_*!,
-# couple_step!, step!, run!) is reused unchanged across both backends -- they only touch
-# interior(...) fields, which both backends expose identically. What differs is model
+# couple_step!, step!, run!) is reused unchanged across both backends -- on the Yelmo side they
+# only touch interior(...) fields, which both backends expose identically (FastHydrology's own
+# fields are plain (Nx, Ny) matrices). What differs is model
 # construction (build_yelmo vs build_yelmo_mirror) and how the "N_eff is set externally" flag
 # is expressed: yneff.method = -1 in Julia's YelmoParameters (dyn.N_eff left alone) vs.
 # hyd.bkt_N_closure = -1 in Fortran's &yhyd (N_CLOSURE_EXTERNAL -- apply_N_closure leaves
@@ -580,7 +581,7 @@ const K24_DT         = Ref(NaN)
 function _post_N!(N::AbstractMatrix, yelmo, sim)
     _frozen_N!(N, yelmo)
     if K24_W_SAT > 0
-        H = interior(yelmo.tpo.H_ice, :, :, 1); W = interior(sim.state.W, :, :, 1); g = _grounded(yelmo)
+        H = interior(yelmo.tpo.H_ice, :, :, 1); W = sim.state.W; g = _grounded(yelmo)
         @inbounds for I in eachindex(N)
             g[I] || continue
             Po = RHO_I * 9.81 * H[I]
@@ -618,7 +619,7 @@ function build_hydrology_sim_K24(yelmo)
     coupling_length_kamb86 = K24_KAMB86   # stress-gradient coupling length [ice thicknesses]; 0 disables the smoothing
     fill_iters    = 10    # iterations to fill local minima in potential field
 
-    grid  = OGRectHydroGrid(Nx, Ny, xlims, ylims; T = T)
+    grid  = ArrayHydroGrid(Nx, Ny, xlims, ylims; T = T)
     sliding_law = K24_SLIDING == "field" ? PrescribedFieldSlidingLaw(grid, T.(interior(yelmo.dyn.taub, :, :, 1))) :
                                            NoFrictionSlidingLaw()
     model = KazmierczakHydroModel(grid, kappa, abs_v_b, A_visc, G, q_T; i_eb = i_eb, rho_i = RHO_I, L_w = L_ICE,
@@ -673,7 +674,7 @@ function install_ub_hook!(coupling::CoupledHydrology{<:SteadyStateSimulation{<:K
             NEFF_IN[] === nothing && (NEFF_IN[] = copy(N_eff))
             "A" in K24_HOLD && K24_HOLD_REF[] !== nothing && (sim.model.A_visc .= K24_HOLD_REF[].A)
             FastHydrology.N_from_ub!(sim.model, sim.grid, sim.state, perYear2perSecond.(uxy_b))
-            N_eff .= interior(sim.state.N, :, :, 1)
+            N_eff .= sim.state.N
             _post_N!(N_eff, yelmo, sim)
             NEFF_TIME[] += time() - t0
             return nothing
@@ -705,7 +706,7 @@ function FastHydrology_to_Yelmo_K24!(yelmo, sim)
     pass === nothing || (C_frz[pass] .= 0)
     K24_FREEZE_DEMAND && (C_frz .= min.(C_frz, max.(perYear2perSecond.(_bmb_star(yelmo)), 0.0)))   # what K24 froze
     K24_CFRZ_OFF && (C_frz .= 0)   # diagnostic: Yelmo never refreezes K24 water (no latent heat from routed water)
-    Q_diss = Array{Float64}(interior(sim.model.Q_diss, :, :, 1))
+    Q_diss = Array{Float64}(sim.model.Q_diss)
     K24_QWAT_PREV[] = Q_diss
     _push_exchange!(yelmo; C_frz = C_frz, Q_diss = Q_diss)
 end
@@ -726,7 +727,7 @@ function build_hydrology_sim_HAB(yelmo)
     h    = interior(yelmo.tpo.H_ice, :, :, 1)
     b    = interior(yelmo.bnd.z_bed, :, :, 1)
 
-    grid  = OGRectHydroGrid(Nx, Ny, xlims, ylims; T = T)
+    grid  = ArrayHydroGrid(Nx, Ny, xlims, ylims; T = T)
     model = HABHydroModel(grid)
     state = HydroState(grid, mask, h, b)
     return SteadyStateSimulation(model, grid, state)
@@ -905,7 +906,7 @@ function update_frozen_bed!(shakti_sim, yelmo)
 end
 
 """Copy Shakti's effective pressure / gap height back into Yelmo boundary fields. Shakti's state
-arrays are plain (Nx, Ny) arrays (unlike K24/HAB's Oceananigans fields), hence writing through
+arrays are plain (Nx, Ny) arrays (as are K24/HAB's since FastHydrology v2), hence writing through
 `interior(...)` on the Yelmo side."""
 function FastHydrology_to_Yelmo_Shakti!(yelmo, shakti_sim;
         dt_host = max(shakti_sim.dt[], yelmo.p.yelmo.dt_min * FastHydrology.SECONDS_PER_YEAR))
@@ -943,13 +944,13 @@ issubset(K24_HOLD, Set(["source", "fric", "qT", "A", "routing", "geom"])) || err
 const K24_HOLD_REF = Ref{Any}(nothing)   # (; G, q_T, i_eb, Q_b, A) of the first full update
 function _hold_capture!(sim)
     m = sim.model
-    K24_HOLD_REF[] = (; G = Array(interior(m.G, :, :, 1)), q_T = Array(interior(m.q_T, :, :, 1)),
-                        i_eb = Array(interior(m.i_eb, :, :, 1)), Q_b = Array(interior(m.Q_b, :, :, 1)),
-                        A = Array(interior(m.A_visc, :, :, 1)), tau = Array(interior(m.sliding_law.tau_b, :, :, 1)),
-                        ub = Array(interior(m.abs_v_b, :, :, 1)),
+    K24_HOLD_REF[] = (; G = Array(m.G), q_T = Array(m.q_T),
+                        i_eb = Array(m.i_eb), Q_b = Array(m.Q_b),
+                        A = Array(m.A_visc), tau = Array(m.sliding_law.tau_b),
+                        ub = Array(m.abs_v_b),
                         fx = m.friction_discretization isa StaggeredFriction ? copy(m.friction_discretization.ux) : nothing,
                         fy = m.friction_discretization isa StaggeredFriction ? copy(m.friction_discretization.uy) : nothing,
-                        h = Array(interior(sim.state.h, :, :, 1)), b = Array(interior(sim.state.b, :, :, 1)))
+                        h = Array(sim.state.h), b = Array(sim.state.b))
     @info "K24_HOLD reference captured" K24_HOLD
 end
 function _hold_apply!(sim)
@@ -958,7 +959,7 @@ function _hold_apply!(sim)
     "source" in K24_HOLD && set_basal_terms!(m; G = r.G, q_T = r.q_T, i_eb = r.i_eb)
     "qT" in K24_HOLD && set_basal_terms!(m; q_T = r.q_T)
     if "source" in K24_HOLD || "fric" in K24_HOLD
-        ub = Array(interior(m.abs_v_b, :, :, 1))
+        ub = Array(m.abs_v_b)
         if m.friction_discretization isa StaggeredFriction
             m.friction_discretization.ux .= r.fx; m.friction_discretization.uy .= r.fy
             uf = m.friction_discretization.u_floor   # beta = tau_b / max(|u_b|, u_floor) = the reference beta
@@ -1107,7 +1108,7 @@ end
 
 """Visualize effective pressure N, dispatched on whichever FastHydrology simulation type is active."""
 plot_N(sim::SteadyStateSimulation, title; kwargs...) =
-    visualize_field(sim.state.N; plot_title = "Effective pressure: " * title, kwargs...)
+    visualize_field(sim.grid, sim.state.N; plot_title = "Effective pressure: " * title, kwargs...)
 
 function plot_N(sim::TimeSimulation{<:ShaktiHydroModel}, title; kwargs...)
     shakti_sim = sim.model.sim
@@ -1170,7 +1171,7 @@ function main()
         if coupling isa CoupledHydrology
             plot_N(coupling.sim, plot_title_list[idx]; display_flag = false, savefig_path = joinpath(PLOT_DIR, "N_$(slug).png"))
         end
-        visualize_field(yelmo.dyn.uxy_s;
+        visualize_field(xnodes(yelmo.dyn.uxy_s), ynodes(yelmo.dyn.uxy_s), interior(yelmo.dyn.uxy_s, :, :, 1);
             plot_title    = "Surface horizontal velocity magnitude: " * plot_title_list[idx],
             display_flag  = false,
             savefig_path  = joinpath(PLOT_DIR, "uxy_s_$(slug).png"),

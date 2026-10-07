@@ -126,7 +126,7 @@ function spinup_nml()
     # SPIN_NML_SET = "group.key=value,group.key=value": generic namelist overrides, applied last
     for item in filter(!isempty, strip.(split(get(ENV, "SPIN_NML_SET", ""), ",")))
         gk, v = strip.(split(item, "=", limit = 2)); g, k = split(gk, ".", limit = 2)
-        val = something(tryparse(Int, v), tryparse(Float64, v), v)
+        val = lowercase(v) in ("true", ".true.") ? true : lowercase(v) in ("false", ".false.") ? false : something(tryparse(Int, v), tryparse(Float64, v), v)
         txt = _nml_set(txt, String(g), String(k), val)
     end
     return txt

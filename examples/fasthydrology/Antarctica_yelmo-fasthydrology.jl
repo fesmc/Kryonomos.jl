@@ -84,6 +84,86 @@ const BMB_SHLF_CONST = -0.5   # [m/yr]
 
 """Heat conducted from the bed into the ice [W/m^2] (Yelmo's Q_ice_b, mW/m^2)."""
 _q_T(yelmo) = interior(yelmo.thrm.Q_ice_b, :, :, 1) .* 1e-3
+# Under-relaxation of the q_T K24 receives (K24_RELAX_QT = omega in (0, 1]; 1: off). q_T is lagged one
+# coupling step and, under the capacity basal BC, carries the latent heat of the freeze-on Yelmo did with
+# K24's previous water: K24 reads it as basal cooling and freezes its water away, Yelmo then has none to
+# freeze, q_T drops, the water returns -- a period-2 oscillation (gain ~1) at cold-bed cells fed by a
+# trickle. q_T <- q_T + omega (Q_ice_b - q_T) damps it (omega = 0.5 removes the period-2 mode in one step)
+# and leaves the fixed point unchanged.
+const K24_RELAX_QT = parse(Float64, get(ENV, "K24_RELAX_QT", "1.0"))
+const K24_QT_PREV  = Ref{Union{Nothing, Matrix{Float64}}}(nothing)
+function _q_T_relaxed(yelmo)
+    qT = Float64.(_q_T(yelmo))
+    (K24_RELAX_QT >= 1 || K24_QT_PREV[] === nothing) && return (K24_QT_PREV[] = qT)
+    return (K24_QT_PREV[] = K24_QT_PREV[] .+ K24_RELAX_QT .* (qT .- K24_QT_PREV[]))
+end
+# Same-step freeze-on at cold bases (K24_COLD_ABSORB = T'_b tolerance [K]; default none). Under the capacity
+# basal BC a base below T_pmp takes Yelmo's flux branch and freezes ALL the water routed into it (C_frz) in the
+# step it is offered, putting the latent heat into Q_ice_b. Without this option K24 learns of that freezing only
+# one step later, as a q_T sink, and removes the same water again from the next step's routing: a cold cell's
+# outflow becomes ~max(0, inflow_now - inflow_before), and trickle-fed cold-bed networks flip wet/dry every
+# coupling step. With it, the cells Yelmo will treat as cold this step (T'_b < -tol, its is_cold_base test)
+# absorb all their inflow in K24's routing (a sink no inflow can exceed, so psi_out clamps to 0: the cell and
+# everything it alone feeds are dry), and freeze_on_capacity! hands Yelmo exactly that absorbed inflow, which
+# it freezes in the same step. The latent heat in their lagged q_T is then irrelevant to K24.
+const K24_COLD_ABSORB = (v = get(ENV, "K24_COLD_ABSORB", "none"); v == "none" ? nothing : parse(Float64, v))
+const K24_ABSORB_QT   = 1.0e3   # [W/m^2] excess of q_T over G at absorbing cells (~100 m/yr of freezing)
+# Yelmo's own cold-base test (ytherm cap_cold_tol, 0.01 K). With K24_COLD_ABSORB above it, the slightly cold cells
+# in between (-K24_COLD_ABSORB <= T'_b < -YELMO_COLD_TOL; sub-grid temperate patches) pass their water on: K24 routes
+# it through, and Yelmo is handed no capacity there (C_frz = 0), so its flux branch freezes nothing and no water is
+# removed twice. Freeze-on still happens once, in the step the water arrives, at the clearly cold cells.
+const YELMO_COLD_TOL = 0.01
+function _pass_through_cells(yelmo)
+    (K24_COLD_ABSORB === nothing || K24_COLD_ABSORB <= YELMO_COLD_TOL) && return nothing
+    T = interior(yelmo.thrm.T_prime_b, :, :, 1)
+    return (T .< -YELMO_COLD_TOL) .& (T .>= -K24_COLD_ABSORB)
+end
+# Demand-limited same-step freeze-on (K24_FREEZE_DEMAND=1; takes precedence over K24_COLD_ABSORB). Yelmo's
+# bmb_grnd_star is the freeze-on rate [m/yr ice, > 0 freezing] that would hold the base at T_pmp, from the start-of-step
+# temperature profile: the most water the base can refreeze before its latent heat warms it to melting. K24's q_T is
+# replaced by the conductive flux of that pmp-held base, q_T* = G + Q_b + Q_wat + rho_i L bmb_star (exactly Q_ice_b at
+# a base Yelmo holds at T_pmp; free of the latent heat a cold base released last step), so each cell's routing sink
+# is its freeze demand and K24 freezes min(inflow, demand) in this step. freeze_on_capacity! is capped at the same
+# demand, so Yelmo's capacity rule freezes exactly that water in the same step, whichever branch it takes, and a
+# cold base never takes more latent heat than warms it to T_pmp (absorb-all froze whole catchments in one cell).
+const K24_FREEZE_DEMAND = get(ENV, "K24_FREEZE_DEMAND", "0") != "0"
+const K24_QWAT_PREV     = Ref{Union{Nothing, Matrix{Float64}}}(nothing)   # water-side heat pushed to Yelmo last step [W/m^2]
+_bmb_star(yelmo) = Float64.(interior(yelmo.thrm.bmb_grnd_star, :, :, 1))   # [m/yr ice], > 0 freeze-on
+function _q_T_star(yelmo)
+    Qwat = K24_QWAT_PREV[] === nothing ? 0.0 : K24_QWAT_PREV[]
+    return _G(yelmo) .+ interior(yelmo.thrm.Q_b, :, :, 1) .* 1e-3 .+ Qwat .+
+           perYear2perSecond.(RHO_I * L_ICE .* _bmb_star(yelmo))
+end
+# Thermal memory of the melt source (K24_TAU_SRC [yr] > 0; default 0: off). The net basal energy available for melt,
+# S = G + Q_b - q_T [W/m^2] (Q_b: Yelmo's frictional heat), is relaxed in time, S <- S_prev + a (S - S_prev),
+# a = dt / (tau + dt), and K24 gets q_T_eff = G + Q_b - S_filtered. Filtering S rather than q_T keeps the exact
+# cancellation of Q_b and q_T at cold bases (each alone flips by orders of magnitude more than their sum).
+# Targets the cold/temperate switching of cells fed by routed water, without filtering N's response to geometry.
+# Diagnostic (K24_CFRZ_OFF=1): hand Yelmo no freeze-on capacity, cutting the routed water -> latent heat -> basal
+# temperature link of the coupling (K24 still removes the water at cold beds in its own routing; not energy conserving).
+const K24_CFRZ_OFF = get(ENV, "K24_CFRZ_OFF", "0") != "0"
+const K24_TAU_SRC  = parse(Float64, get(ENV, "K24_TAU_SRC", "0.0"))
+const K24_SRC_PREV = Ref{Union{Nothing, Matrix{Float64}}}(nothing)
+function _q_T_k24(yelmo)
+    qT = _q_T_k24_raw(yelmo)
+    K24_TAU_SRC > 0 || return qT
+    base = _G(yelmo) .+ interior(yelmo.thrm.Q_b, :, :, 1) .* 1e-3
+    S = base .- qT
+    if K24_SRC_PREV[] !== nothing && isfinite(K24_DT[])
+        a = K24_DT[] / (K24_TAU_SRC + K24_DT[])
+        S = K24_SRC_PREV[] .+ a .* (S .- K24_SRC_PREV[])
+    end
+    K24_SRC_PREV[] = S
+    return base .- S
+end
+function _q_T_k24_raw(yelmo)
+    K24_FREEZE_DEMAND && return ifelse.(_grounded(yelmo), _q_T_star(yelmo), Float64.(_q_T(yelmo)))
+    qT = _q_T_relaxed(yelmo)
+    K24_COLD_ABSORB === nothing && return qT
+    cold = (interior(yelmo.thrm.T_prime_b, :, :, 1) .< -K24_COLD_ABSORB) .& _grounded(yelmo)
+    return ifelse.(cold, _G(yelmo) .+ K24_ABSORB_QT, qT)
+end
+
 # Heat from below [W/m^2] for the hydrology's melt balance: the flux at the top of Yelmo's bedrock
 # column (Q_rock), which is what Yelmo's own basal balance uses -- not Q_geo at depth, which differs
 # while the bedrock is still warming. With Q_geo, L*mdot = G + Q_b + Q_wat - q_T is off from Yelmo's
@@ -416,6 +496,103 @@ K24_SLIDING in ("field", "none") || error("K24_SLIDING must be 'field' or 'none'
 const K24_A_BASAL = get(ENV, "K24_A_BASAL", "1") != "0"
 _A_visc(yelmo) = perYear2perSecond.(K24_A_BASAL ? interior(yelmo.mat.ATT)[:, :, 1] : mean(interior(yelmo.mat.ATT), dims=3)[:, :, 1])
 const K24_UB_HOOK = get(ENV, "K24_UB_HOOK", "1") != "0"
+# Bed type kappa (0: hard, 1: soft). K24_KAPPA=hard (default) is 0 everywhere; mixed_smooth is K24's own
+# Antarctic rule (Kazmierczak et al. 2024, Sect. 4.1, "heterogeneous mixed"): soft below -1500 m bed
+# elevation, hard above -500 m, linear in between; mixed is the sharp version at -1000 m. The bed is the
+# present-day observed one (K24_KAPPA_BED=pd, default: bed type as a property of the substrate, set once)
+# or the current, isostatically moving z_bed (K24_KAPPA_BED=now, recomputed at every K24 update).
+const K24_KAPPA     = Symbol(get(ENV, "K24_KAPPA", "hard"))
+const K24_KAPPA_BED = get(ENV, "K24_KAPPA_BED", "pd")
+K24_KAPPA_BED in ("pd", "now") || error("K24_KAPPA_BED must be 'pd' or 'now', got '$K24_KAPPA_BED'")
+# Present-day bed for K24_KAPPA_BED=pd. YelmoMirror cannot read dta%pd%z_bed (the C API has no
+# dta_pd_z_bed getter, the Julia field is never filled), so a Mirror driver sets this from the
+# observation file Yelmo loads it from.
+const K24_PD_BED = Ref{Union{Nothing, Matrix{Float64}}}(nothing)
+function _kappa_bed(yelmo)
+    K24_KAPPA_BED == "now" && return Float64.(interior(yelmo.bnd.z_bed, :, :, 1))
+    K24_PD_BED[] !== nothing && return K24_PD_BED[]
+    BACKEND == "mirror" && error("K24_KAPPA_BED=pd on YelmoMirror: set K24_PD_BED[] to the present-day bed")
+    return Float64.(interior(yelmo.dta.pd_z_bed, :, :, 1))
+end
+_kappa(yelmo) = FastHydrology.initialize_κ(yelmo.g.Nx, yelmo.g.Ny, _kappa_bed(yelmo); bed_rheology = K24_KAPPA)
+# Frictional heat in K24's water source: "cell" (default) tau_b*|u_b| at cell centres; "faces"
+# (StaggeredFriction) tau_x*u_x and tau_y*u_y formed on the C-grid faces and averaged to the centre, the
+# construction of Yelmo's qb_method = 1; "nodes" (StaggeredFriction(quadrature = true)) |u||tau| at the
+# 2x2 Gauss points, Yelmo's qb_method = 4. Pair it with the matching ytherm.qb_method so K24's melt and
+# Yelmo's basal energy balance see the same heat.
+const K24_FRICTION = get(ENV, "K24_FRICTION", "cell")
+K24_FRICTION in ("cell", "faces", "nodes") || error("K24_FRICTION must be 'cell', 'faces' or 'nodes', got '$K24_FRICTION'")
+# Face velocities in Yelmo's acx/acy convention, (Nx, Ny) with ux[i, j] on the face between cells i and i+1.
+# Oceananigans Face fields carry Nx+1 faces with the Fortran acx array at 2:end (YelmoMirror _get_var!).
+_acx(f, Nx) = (a = interior(f, :, :, 1); size(a, 1) == Nx + 1 ? a[2:end, :] : a)
+_acy(f, Ny) = (a = interior(f, :, :, 1); size(a, 2) == Ny + 1 ? a[:, 2:end] : a)
+_ub_faces(yelmo) = (perYear2perSecond.(_acx(yelmo.dyn.ux_b, yelmo.g.Nx)), perYear2perSecond.(_acy(yelmo.dyn.uy_b, yelmo.g.Ny)))
+_friction_discretization(yelmo) = K24_FRICTION == "cell" ? CellCentredFriction() :
+    StaggeredFriction(_ub_faces(yelmo)...; quadrature = K24_FRICTION == "nodes")
+const K24_SIGMAT = parse(Float64, get(ENV, "K24_SIGMAT", "0.0"))   # floor N >= sigmat * overburden; 0: no floor
+const K24_KAMB86 = parse(Float64, get(ENV, "K24_KAMB86", "0.0"))   # Kamb & Echelmeyer (1986) coupling length [ice thicknesses]; 0: off
+# Frozen bed (K24_FROZEN_BED = T'_b threshold [K]; default none). K24 has no frozen bed and routes water under any
+# grounded ice. With a threshold, cells with T'_b below it leave K24's routing domain (water cannot pass; water that
+# reaches a frozen front leaves the domain, i.e. refreezes) and are dry: N = overburden, in the full update and in the
+# DIVA callback. A frozen cell thaws at T'_b >= threshold + K24_FROZEN_HYST, so cells at the threshold do not flip
+# every update. The frozen state is updated once per full K24 update (couple_step!).
+const K24_FROZEN_BED  = (v = get(ENV, "K24_FROZEN_BED", "none"); v == "none" ? nothing : parse(Float64, v))
+const K24_FROZEN_HYST = parse(Float64, get(ENV, "K24_FROZEN_HYST", "0.5"))
+const K24_FROZEN      = Ref{Union{Nothing, BitMatrix}}(nothing)
+_grounded(yelmo) = _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd) .> 0
+function _update_frozen!(yelmo)
+    K24_FROZEN_BED === nothing && return nothing
+    T = Array(interior(yelmo.thrm.T_prime_b, :, :, 1))
+    if K24_FROZEN[] === nothing
+        K24_FROZEN[] = BitMatrix(T .< K24_FROZEN_BED)
+    else
+        f = K24_FROZEN[]
+        f .= ifelse.(T .< K24_FROZEN_BED, true, ifelse.(T .>= K24_FROZEN_BED + K24_FROZEN_HYST, false, f))
+    end
+    return K24_FROZEN[]
+end
+_k24_mask(yelmo) = K24_FROZEN[] === nothing ? _grounded(yelmo) : _grounded(yelmo) .& .!K24_FROZEN[]
+"""Dry frozen bed: N = overburden rho_i g H at grounded frozen cells (no-op without K24_FROZEN_BED)."""
+function _frozen_N!(N::AbstractMatrix, yelmo)
+    K24_FROZEN[] === nothing && return N
+    fr = K24_FROZEN[] .& _grounded(yelmo)
+    H  = interior(yelmo.tpo.H_ice, :, :, 1)
+    @inbounds for I in findall(fr)
+        N[I] = RHO_I * 9.81 * H[I]   # Earth g, as Yelmo's phys_const
+    end
+    return N
+end
+
+# Two optional treatments of the N K24 hands Yelmo (both off by default), applied after the frozen-bed
+# override wherever N is pushed (full update and DIVA callback):
+#  - K24_W_SAT [m] > 0: wetness blend N = Po - (Po - N_K24) min(1, W / K24_W_SAT). K24's hard-bed N drops
+#    from overburden to ~N_K24 for any trickle (N_inf ~ Q^-0.27), a near-switch at a cell's wet/dry edge;
+#    the blend makes N continuous in the water thickness, as a till-saturation closure does.
+#  - K24_TAU_N [yr] > 0: implicit time relaxation N = N_prev + a (N_K24 - N_prev), a = dt / (tau + dt),
+#    N_prev the N Yelmo used over the previous coupling step. Filters the coupling-step flicker of K24 N
+#    (cold-bed cells fed by a trickle switch wet/dry with the lagged freeze-on exchange). Active once the
+#    host sets K24_RELAX_N_ON[] = true (after any start-up use of the raw K24 N).
+const K24_W_SAT      = parse(Float64, get(ENV, "K24_W_SAT", "0.0"))
+const K24_TAU_N      = parse(Float64, get(ENV, "K24_TAU_N", "0.0"))
+const K24_RELAX_N_ON = Ref(false)
+const K24_N_PREV     = Ref{Union{Nothing, Matrix{Float64}}}(nothing)
+const K24_DT         = Ref(NaN)
+function _post_N!(N::AbstractMatrix, yelmo, sim)
+    _frozen_N!(N, yelmo)
+    if K24_W_SAT > 0
+        H = interior(yelmo.tpo.H_ice, :, :, 1); W = interior(sim.state.W, :, :, 1); g = _grounded(yelmo)
+        @inbounds for I in eachindex(N)
+            g[I] || continue
+            Po = RHO_I * 9.81 * H[I]
+            N[I] = Po - (Po - N[I]) * min(1.0, W[I] / K24_W_SAT)
+        end
+    end
+    if K24_TAU_N > 0 && K24_RELAX_N_ON[] && K24_N_PREV[] !== nothing && isfinite(K24_DT[])
+        a = K24_DT[] / (K24_TAU_N + K24_DT[])
+        @. N = K24_N_PREV[] + a * (N - K24_N_PREV[])
+    end
+    return N
+end
 
 """Build a FastHydrology SteadyStateSimulation wrapping KazmierczakHydroModel, from `yelmo`'s current fields."""
 function build_hydrology_sim_K24(yelmo)
@@ -426,18 +603,19 @@ function build_hydrology_sim_K24(yelmo)
     xlims  = (0, T(yelmo.g.Δxᶜᵃᵃ * Nx))
     ylims  = (0, T(yelmo.g.Δyᵃᶜᵃ * Ny))
 
-    mask    = _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd) .> 0
+    _update_frozen!(yelmo)
+    mask    = _k24_mask(yelmo)
     h       = interior(yelmo.tpo.H_ice,  :, :, 1)   # ice thickness
     b       = interior(yelmo.bnd.z_bed,  :, :, 1)   # bedrock elevation
     abs_v_b = perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1))              # basal speed
     A_visc  = _A_visc(yelmo)   # basal (or depth-averaged) rate factor, see K24_A_BASAL
     # Water source from terms [W/m^2] and water from above [kg/m^2/s] (see _q_T/_melt_int).
     G       = _G(yelmo)
-    q_T     = _q_T(yelmo)
+    q_T     = _q_T_k24(yelmo)
     i_eb    = perYear2perSecond.(_melt_int(yelmo) .* RHO_I)
-    kappa   = zeros(T, Nx, Ny)   # bed hardness (0: hard, 1: soft)
+    kappa   = T.(_kappa(yelmo))   # bed hardness (0: hard, 1: soft), see K24_KAPPA
 
-    coupling_length_kamb86 = 0.0   # stress-gradient coupling length [ice thicknesses]; 0 disables the smoothing
+    coupling_length_kamb86 = K24_KAMB86   # stress-gradient coupling length [ice thicknesses]; 0 disables the smoothing
     fill_iters    = 10    # iterations to fill local minima in potential field
 
     grid  = OGRectHydroGrid(Nx, Ny, xlims, ylims; T = T)
@@ -445,21 +623,28 @@ function build_hydrology_sim_K24(yelmo)
                                            NoFrictionSlidingLaw()
     model = KazmierczakHydroModel(grid, kappa, abs_v_b, A_visc, G, q_T; i_eb = i_eb, rho_i = RHO_I, L_w = L_ICE,
                                   coupling_length_kamb86 = coupling_length_kamb86, fill_iters = fill_iters,
-                                  sliding_law = sliding_law)
+                                  sliding_law = sliding_law, sigmat = K24_SIGMAT,
+                                  friction_discretization = _friction_discretization(yelmo))
     state = HydroState(grid, mask, h, b)
     return SteadyStateSimulation(model, grid, state)
 end
 
 """Copy Yelmo fields → FastHydrology state/model (K24)."""
 function Yelmo_to_FastHydrology_K24!(sim, yelmo)
-    sim.state.mask    .= _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd) .> 0
+    _update_frozen!(yelmo)
+    sim.state.mask    .= _k24_mask(yelmo)
     sim.state.h       .= interior(yelmo.tpo.H_ice, :, :, 1)
     sim.state.b       .= interior(yelmo.bnd.z_bed, :, :, 1)
     sim.model.abs_v_b .= perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1))
     sim.model.A_visc  .= _A_visc(yelmo)
-    set_basal_terms!(sim.model; G = _G(yelmo), q_T = _q_T(yelmo),
+    set_basal_terms!(sim.model; G = _G(yelmo), q_T = _q_T_k24(yelmo),
                      i_eb = perYear2perSecond.(_melt_int(yelmo) .* RHO_I))
-    fill!(sim.model.kappa, 0)
+    K24_KAPPA_BED == "now" && (sim.model.kappa .= _kappa(yelmo))
+    if sim.model.friction_discretization isa StaggeredFriction   # this step's face velocities
+        ux, uy = _ub_faces(yelmo)
+        sim.model.friction_discretization.ux .= ux
+        sim.model.friction_discretization.uy .= uy
+    end
     K24_SLIDING == "field" && (sim.model.sliding_law.tau_b .= interior(yelmo.dyn.taub, :, :, 1))   # [Pa]
 end
 
@@ -471,6 +656,7 @@ Requires `yneff.method = -1` (set by `external_neff`). A no-op for models whose 
 u_b. Julia backend: `yelmo.hooks.neff_from_ub`; Mirror backend: Fortran Yelmo's DIVA iteration calls back into
 Julia (`yelmo_set_neff_callback!`)."""
 const NEFF_CALLS = Ref(0)   # calls of the N hook (diagnostic)
+const NEFF_TIME  = Ref(0.0) # wall time spent in the N hook [s] (diagnostic)
 const NEFF_IN = Ref{Any}(nothing)   # N the first call of a step received (diagnostic)
 install_ub_hook!(coupling, yelmo) = nothing
 function install_ub_hook!(coupling::CoupledHydrology{<:SteadyStateSimulation{<:KazmierczakHydroModel}}, yelmo)
@@ -482,10 +668,14 @@ function install_ub_hook!(coupling::CoupledHydrology{<:SteadyStateSimulation{<:K
         # [m/yr] on aa-nodes and takes N [Pa] back (yelmo_set_neff_callback!). The geometry, rate
         # factor and the routing are those of this step's `couple_step!`, which ran just before.
         Yelmo.yelmo_set_neff_callback!(yelmo, function (N_eff, uxy_b)
+            t0 = time()
             NEFF_CALLS[] += 1
             NEFF_IN[] === nothing && (NEFF_IN[] = copy(N_eff))
+            "A" in K24_HOLD && K24_HOLD_REF[] !== nothing && (sim.model.A_visc .= K24_HOLD_REF[].A)
             FastHydrology.N_from_ub!(sim.model, sim.grid, sim.state, perYear2perSecond.(uxy_b))
             N_eff .= interior(sim.state.N, :, :, 1)
+            _post_N!(N_eff, yelmo, sim)
+            NEFF_TIME[] += time() - t0
             return nothing
         end)
         return nothing
@@ -494,11 +684,12 @@ function install_ub_hook!(coupling::CoupledHydrology{<:SteadyStateSimulation{<:K
         NEFF_CALLS[] += 1
         uxy_b = yelmo.dyn.uxy_b   # scratch aa field: rebuilt by Yelmo's end-of-step diagnostics
         Yelmo.calc_magnitude_from_staggered!(uxy_b, ux_b, uy_b, yelmo.tpo.f_ice_dyn)
-        sim.state.mask   .= _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd) .> 0
+        sim.state.mask   .= _k24_mask(yelmo)
         sim.state.h      .= interior(yelmo.tpo.H_ice, :, :, 1)
         sim.model.A_visc .= _A_visc(yelmo)
         FastHydrology.N_from_ub!(sim.model, sim.grid, sim.state, perYear2perSecond.(interior(uxy_b, :, :, 1)))
         interior(N_eff, :, :, 1) .= sim.state.N
+        _post_N!(view(interior(N_eff), :, :, 1), yelmo, sim)
         return nothing
     end
     return nothing
@@ -507,9 +698,16 @@ end
 """Copy FastHydrology outputs → Yelmo boundary fields (K24)."""
 function FastHydrology_to_Yelmo_K24!(yelmo, sim)
     yelmo.dyn.N_eff .= sim.state.N   # effective pressure
+    _post_N!(view(interior(yelmo.dyn.N_eff), :, :, 1), yelmo, sim)   # dry frozen bed, wetness blend, time relaxation
     yelmo.thrm.H_w  .= sim.state.W   # subglacial water thickness
     C_frz = FastHydrology.freeze_on_capacity!(zeros(size(interior(yelmo.dyn.N_eff, :, :, 1))), sim.model, sim.grid, sim.state)
-    _push_exchange!(yelmo; C_frz = C_frz, Q_diss = Array(interior(sim.model.Q_diss, :, :, 1)))
+    pass = _pass_through_cells(yelmo)
+    pass === nothing || (C_frz[pass] .= 0)
+    K24_FREEZE_DEMAND && (C_frz .= min.(C_frz, max.(perYear2perSecond.(_bmb_star(yelmo)), 0.0)))   # what K24 froze
+    K24_CFRZ_OFF && (C_frz .= 0)   # diagnostic: Yelmo never refreezes K24 water (no latent heat from routed water)
+    Q_diss = Array{Float64}(interior(sim.model.Q_diss, :, :, 1))
+    K24_QWAT_PREV[] = Q_diss
+    _push_exchange!(yelmo; C_frz = C_frz, Q_diss = Q_diss)
 end
 
 # ── HAB (height above buoyancy): build + coupling functions ───────────────────
@@ -726,10 +924,77 @@ end
 whichever FastHydrology model is active in `sim`. `frozen_bed_threshold` (see
 [`FROZEN_BED_THRESHOLD`](@ref)) is accepted by every method for a uniform call site in `step!`
 below, but only the Shakti method does anything with it -- K24/HAB have no FROZEN_BED concept."""
+# Feedback-isolation diagnostics (K24_HOLD = comma list; default empty). After the first full K24 update of a run,
+# hold one pathway of the K24 -> N dependence at that update's values, everything else live:
+#  - source:  the routed water source. G, q_T and i_eb stay as the first update set them, and the frictional heat
+#             heat stays at its first-update field: with StaggeredFriction the face velocities are held and tau_b is
+#             rescaled as tau_ref |u_b| / |u_b|_ref (so beta and Q_b are the reference ones); with CellCentredFriction
+#             tau_b = Q_b_ref / |u_b|. Only Q_diss (dissipation of the routed flux) still varies. Removes the melt feedback (u_b -> Q_b -> melt -> q -> N).
+#  - fric / qT: only the frictional heat (as in source) / only q_T of the source (G and i_eb live).
+#  - A:       the basal rate factor K24 sees (A_visc), in the full update and the DIVA hook. Removes the
+#             softening feedback (warm base -> large A -> low N, N_inf ~ A^(-1/3)).
+#  - geom:    the routing geometry: K24's flux solve sees the first update's ice thickness and bed (so the hydraulic
+#             potential, flow directions and phi0 stay), then N is re-evaluated with the live overburden. Removes the
+#             water-piracy feedback (H -> phi -> flow paths -> q -> N); the source stays live.
+#  - routing: no full K24 update after the first: q, |grad phi0| and phi0 stay; each step only re-evaluates N
+#             (update_N!) from the live u_b, overburden and A. Removes every routing/source/geometry feedback.
+const K24_HOLD = Set(filter(!isempty, strip.(split(get(ENV, "K24_HOLD", ""), ","))))
+issubset(K24_HOLD, Set(["source", "fric", "qT", "A", "routing", "geom"])) || error("K24_HOLD: unknown item in $(K24_HOLD)")
+const K24_HOLD_REF = Ref{Any}(nothing)   # (; G, q_T, i_eb, Q_b, A) of the first full update
+function _hold_capture!(sim)
+    m = sim.model
+    K24_HOLD_REF[] = (; G = Array(interior(m.G, :, :, 1)), q_T = Array(interior(m.q_T, :, :, 1)),
+                        i_eb = Array(interior(m.i_eb, :, :, 1)), Q_b = Array(interior(m.Q_b, :, :, 1)),
+                        A = Array(interior(m.A_visc, :, :, 1)), tau = Array(interior(m.sliding_law.tau_b, :, :, 1)),
+                        ub = Array(interior(m.abs_v_b, :, :, 1)),
+                        fx = m.friction_discretization isa StaggeredFriction ? copy(m.friction_discretization.ux) : nothing,
+                        fy = m.friction_discretization isa StaggeredFriction ? copy(m.friction_discretization.uy) : nothing,
+                        h = Array(interior(sim.state.h, :, :, 1)), b = Array(interior(sim.state.b, :, :, 1)))
+    @info "K24_HOLD reference captured" K24_HOLD
+end
+function _hold_apply!(sim)
+    (isempty(K24_HOLD) || K24_HOLD_REF[] === nothing) && return nothing
+    r = K24_HOLD_REF[]; m = sim.model
+    "source" in K24_HOLD && set_basal_terms!(m; G = r.G, q_T = r.q_T, i_eb = r.i_eb)
+    "qT" in K24_HOLD && set_basal_terms!(m; q_T = r.q_T)
+    if "source" in K24_HOLD || "fric" in K24_HOLD
+        ub = Array(interior(m.abs_v_b, :, :, 1))
+        if m.friction_discretization isa StaggeredFriction
+            m.friction_discretization.ux .= r.fx; m.friction_discretization.uy .= r.fy
+            uf = m.friction_discretization.u_floor   # beta = tau_b / max(|u_b|, u_floor) = the reference beta
+            m.sliding_law.tau_b .= r.tau .* max.(ub, uf) ./ max.(r.ub, uf)
+        else
+            m.sliding_law.tau_b .= ifelse.(ub .> 0, r.Q_b ./ max.(ub, 1e-20), 0.0)
+        end
+    end
+    "A" in K24_HOLD && (m.A_visc .= r.A)
+    return nothing
+end
+
 function couple_step!(::KazmierczakHydroModel, sim, yelmo, dt; frozen_bed_threshold = nothing)
+    K24_DT[] = dt
+    K24_N_PREV[] = Array{Float64}(interior(yelmo.dyn.N_eff, :, :, 1))   # the N Yelmo used last step (see K24_TAU_N)
+    if "routing" in K24_HOLD && K24_HOLD_REF[] !== nothing
+        # N only, from the held routing: live overburden, mask and u_b; A live unless also held
+        sim.state.h .= interior(yelmo.tpo.H_ice, :, :, 1)
+        sim.model.A_visc .= _A_visc(yelmo)
+        _hold_apply!(sim)
+        FastHydrology.N_from_ub!(sim.model, sim.grid, sim.state, perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1)))
+        FastHydrology_to_Yelmo_K24!(yelmo, sim)
+        return nothing
+    end
     Yelmo_to_FastHydrology_K24!(sim, yelmo)
-    FastHydrology.run!(sim)
+    _hold_apply!(sim)
+    if "geom" in K24_HOLD && K24_HOLD_REF[] !== nothing
+        sim.state.h .= K24_HOLD_REF[].h; sim.state.b .= K24_HOLD_REF[].b
+        FastHydrology.run!(sim)   # routing on the held geometry
+        sim.state.h .= interior(yelmo.tpo.H_ice, :, :, 1); sim.state.b .= interior(yelmo.bnd.z_bed, :, :, 1)
+        FastHydrology.update_N!(sim.model, sim.grid, sim.state)   # live overburden
+    else
+        FastHydrology.run!(sim)
+    end
     FastHydrology_to_Yelmo_K24!(yelmo, sim)
+    isempty(K24_HOLD) || K24_HOLD_REF[] !== nothing || _hold_capture!(sim)
 end
 
 function couple_step!(::HABHydroModel, sim, yelmo, dt; frozen_bed_threshold = nothing)

@@ -552,7 +552,20 @@ function _update_frozen!(yelmo)
     end
     return K24_FROZEN[]
 end
-_k24_mask(yelmo) = K24_FROZEN[] === nothing ? _grounded(yelmo) : _grounded(yelmo) .& .!K24_FROZEN[]
+"""FastHydrology (>= 3) mask codes from Yelmo's own labels, as `load_yelmox` does: grounded ice GROUNDED, every
+other cell an outlet (ice-free land LAND, floating ice and open water OCEAN). `closed` marks grounded ice that
+is not solved (OTHER_BASIN: closed, no water crosses)."""
+function _fh_mask(yelmo, closed = nothing)
+    g = _grounded(yelmo)
+    h = Array(interior(yelmo.tpo.H_ice, :, :, 1))
+    b = Array(interior(yelmo.bnd.z_bed, :, :, 1))
+    return map(CartesianIndices(g)) do I
+        g[I] ? ((closed !== nothing && closed[I]) ? FastHydrology.OTHER_BASIN : FastHydrology.GROUNDED) :
+               (h[I] <= 0 && b[I] >= 0) ? FastHydrology.LAND : FastHydrology.OCEAN
+    end
+end
+# frozen-bed cells stay out of the solve, as before: grounded ice that is not solved is OTHER_BASIN
+_k24_mask(yelmo) = _fh_mask(yelmo, K24_FROZEN[])
 """Dry frozen bed: N = overburden rho_i g H at grounded frozen cells (no-op without K24_FROZEN_BED)."""
 function _frozen_N!(N::AbstractMatrix, yelmo)
     K24_FROZEN[] === nothing && return N
@@ -626,7 +639,7 @@ function build_hydrology_sim_K24(yelmo)
                                   coupling_length_kamb86 = coupling_length_kamb86, fill_iters = fill_iters,
                                   sliding_law = sliding_law, sigmat = K24_SIGMAT,
                                   friction_discretization = _friction_discretization(yelmo))
-    state = HydroState(grid, mask, h, b)
+    state = HydroState(grid, HydroMask(mask), h, b)
     return SteadyStateSimulation(model, grid, state)
 end
 
@@ -723,19 +736,19 @@ function build_hydrology_sim_HAB(yelmo)
     xlims  = (0, T(yelmo.g.Δxᶜᵃᵃ * Nx))
     ylims  = (0, T(yelmo.g.Δyᵃᶜᵃ * Ny))
 
-    mask = _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd) .> 0
+    mask = _fh_mask(yelmo)
     h    = interior(yelmo.tpo.H_ice, :, :, 1)
     b    = interior(yelmo.bnd.z_bed, :, :, 1)
 
     grid  = ArrayHydroGrid(Nx, Ny, xlims, ylims; T = T)
     model = HABHydroModel(grid)
-    state = HydroState(grid, mask, h, b)
+    state = HydroState(grid, HydroMask(mask), h, b)
     return SteadyStateSimulation(model, grid, state)
 end
 
 """Copy Yelmo fields → FastHydrology state (HAB)."""
 function Yelmo_to_FastHydrology_HAB!(sim, yelmo)
-    sim.state.mask .= _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd) .> 0
+    sim.state.mask .= _fh_mask(yelmo)
     sim.state.h    .= interior(yelmo.tpo.H_ice, :, :, 1)
     sim.state.b    .= interior(yelmo.bnd.z_bed, :, :, 1)
 end

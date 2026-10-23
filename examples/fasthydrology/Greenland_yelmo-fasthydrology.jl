@@ -189,6 +189,15 @@ function _compute_interior(op)
     return interior(result, :, :, 1)
 end
 
+"""FastHydrology (>= 3) mask codes from Yelmo's own labels, as `load_yelmox` does: grounded ice GROUNDED, every
+other cell an outlet (ice-free land LAND, floating ice and open water OCEAN)."""
+function _fh_mask(y)
+    g = _compute_interior(y.tpo.f_ice * y.tpo.f_grnd) .> 0
+    h = Array(interior(y.tpo.H_ice, :, :, 1))
+    b = Array(interior(y.bnd.z_bed, :, :, 1))
+    return map((gc, hc, bc) -> gc ? FastHydrology.GROUNDED : (hc <= 0 && bc >= 0) ? FastHydrology.LAND : FastHydrology.OCEAN, g, h, b)
+end
+
 # ── Yelmo setup ───────────────────────────────────────────────────────────────
 
 """`external_neff = true` overrides `yneff.method` to -1 (see `setup_yelmo` for the full
@@ -411,7 +420,7 @@ function build_hydrology_sim_K24(yelmo)
     xlims  = (0, T(yelmo.g.Δxᶜᵃᵃ * Nx))
     ylims  = (0, T(yelmo.g.Δyᵃᶜᵃ * Ny))
 
-    mask    = _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd) .> 0
+    mask    = _fh_mask(yelmo)
     h       = interior(yelmo.tpo.H_ice,  :, :, 1)   # ice thickness
     b       = interior(yelmo.bnd.z_bed,  :, :, 1)   # bedrock elevation
     abs_v_b = perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1))              # basal speed
@@ -431,13 +440,13 @@ function build_hydrology_sim_K24(yelmo)
     model = KazmierczakHydroModel(grid, kappa, abs_v_b, A_visc, G, q_T; i_eb = i_eb, rho_i = RHO_I, L_w = L_ICE,
                                   coupling_length_kamb86 = coupling_length_kamb86, fill_iters = fill_iters,
                                   sliding_law = sliding_law)
-    state = HydroState(grid, mask, h, b)
+    state = HydroState(grid, HydroMask(mask), h, b)
     return SteadyStateSimulation(model, grid, state)
 end
 
 """Copy Yelmo fields → FastHydrology state/model (K24)."""
 function Yelmo_to_FastHydrology_K24!(sim, yelmo)
-    sim.state.mask    .= _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd) .> 0
+    sim.state.mask    .= _fh_mask(yelmo)
     sim.state.h       .= interior(yelmo.tpo.H_ice, :, :, 1)
     sim.state.b       .= interior(yelmo.bnd.z_bed, :, :, 1)
     sim.model.abs_v_b .= perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1))
@@ -479,7 +488,7 @@ function install_ub_hook!(coupling::CoupledHydrology{<:SteadyStateSimulation{<:K
         NEFF_CALLS[] += 1
         uxy_b = yelmo.dyn.uxy_b   # scratch aa field: rebuilt by Yelmo's end-of-step diagnostics
         Yelmo.calc_magnitude_from_staggered!(uxy_b, ux_b, uy_b, yelmo.tpo.f_ice_dyn)
-        sim.state.mask   .= _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd) .> 0
+        sim.state.mask   .= _fh_mask(yelmo)
         sim.state.h      .= interior(yelmo.tpo.H_ice, :, :, 1)
         sim.model.A_visc .= _A_visc(yelmo)
         FastHydrology.N_from_ub!(sim.model, sim.grid, sim.state, perYear2perSecond.(interior(uxy_b, :, :, 1)))
@@ -509,19 +518,19 @@ function build_hydrology_sim_HAB(yelmo)
     xlims  = (0, T(yelmo.g.Δxᶜᵃᵃ * Nx))
     ylims  = (0, T(yelmo.g.Δyᵃᶜᵃ * Ny))
 
-    mask = _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd) .> 0
+    mask = _fh_mask(yelmo)
     h    = interior(yelmo.tpo.H_ice, :, :, 1)
     b    = interior(yelmo.bnd.z_bed, :, :, 1)
 
     grid  = ArrayHydroGrid(Nx, Ny, xlims, ylims; T = T)
     model = HABHydroModel(grid)
-    state = HydroState(grid, mask, h, b)
+    state = HydroState(grid, HydroMask(mask), h, b)
     return SteadyStateSimulation(model, grid, state)
 end
 
 """Copy Yelmo fields → FastHydrology state (HAB)."""
 function Yelmo_to_FastHydrology_HAB!(sim, yelmo)
-    sim.state.mask .= _compute_interior(yelmo.tpo.f_ice * yelmo.tpo.f_grnd) .> 0
+    sim.state.mask .= _fh_mask(yelmo)
     sim.state.h    .= interior(yelmo.tpo.H_ice, :, :, 1)
     sim.state.b    .= interior(yelmo.bnd.z_bed, :, :, 1)
 end

@@ -467,7 +467,7 @@ Julia (`yelmo_set_neff_callback!`)."""
 const NEFF_CALLS = Ref(0)   # calls of the N hook (diagnostic)
 const NEFF_IN = Ref{Any}(nothing)   # N the first call of a step received (diagnostic)
 install_ub_hook!(coupling, yelmo) = nothing
-function install_ub_hook!(coupling::CoupledHydrology{<:SteadyStateSimulation{<:KazmierczakHydroModel}}, yelmo)
+function install_ub_hook!(coupling::CoupledHydrology{<:SteadyStateSimulation{<:Union{KazmierczakHydroModel, AguamentiHydroModel}}}, yelmo)
     K24_UB_HOOK || return nothing
     sim = coupling.sim
     FastHydrology.N_responds_to_ub(sim.model) || return nothing
@@ -504,6 +504,90 @@ function FastHydrology_to_Yelmo_K24!(yelmo, sim)
     yelmo.thrm.H_w  .= sim.state.W   # subglacial water thickness
     C_frz = FastHydrology.freeze_on_capacity!(zeros(size(interior(yelmo.dyn.N_eff, :, :, 1))), sim.model, sim.grid, sim.state)
     _push_exchange!(yelmo; C_frz = C_frz, Q_diss = Array(sim.model.Q_diss))
+end
+
+# ── Aguamenti v1.0 (Gregov et al.): build + coupling functions ───────────────
+# Same supply as K24 (G = Q_rock, q_T = Q_ice_b, i_eb = melt_int, frictional heat from Yelmo's tau_b
+# with K24_SLIDING=field, dissipation melt on) and the same routing. Aguamenti carries two state
+# fields, the till effective stress N_t and the channel indicator chi: the first coupling puts them in
+# their steady state for the Yelmo state it starts from (update_steady_state!), every later one
+# advances them over the Yelmo step (FastHydrology.step!, with Yelmo's dHidt for the undrained till
+# response). The DIVA hook re-evaluates N from each iteration's u_b (N_from_ub!, routing, till and
+# chi held), as for K24.
+#   AGU_KAPPA  soft-bed fraction: "mixed_smooth" (default, from the bed elevation as in the K24
+#              checks), or a number in [0, 1] (0 hard bed, 1 soft bed everywhere)
+#   AGU_COLD_T cold base where Yelmo's T_prime_b < AGU_COLD_T [K] (default -1, Yelmo's bmb cutoff);
+#              "none" treats every grounded cell as temperate
+#   AGU_SPINUP number of steady solves at the start (default 1)
+const AGU_KAPPA  = get(ENV, "AGU_KAPPA", "mixed_smooth")
+const AGU_COLD_T = (v = get(ENV, "AGU_COLD_T", "-1.0"); v == "none" ? nothing : parse(Float64, v))
+const AGU_SECONDS_PER_YEAR = 1 / perYear2perSecond(1.0)   # the same year as every velocity conversion here
+const AGU_SPUN_UP = Ref(false)
+
+_agu_cold(yelmo) = AGU_COLD_T === nothing ? nothing : Float64.(interior(yelmo.thrm.T_prime_b, :, :, 1) .< AGU_COLD_T)
+function _agu_kappa(yelmo)
+    Nx, Ny = yelmo.g.Nx, yelmo.g.Ny
+    AGU_KAPPA == "mixed_smooth" &&
+        return Float64.(FastHydrology.initialize_κ(Nx, Ny, Float64.(interior(yelmo.bnd.z_bed, :, :, 1)); bed_rheology = :mixed_smooth))
+    return fill(parse(Float64, AGU_KAPPA), Nx, Ny)
+end
+
+"""Build a FastHydrology SteadyStateSimulation wrapping AguamentiHydroModel, from `yelmo`'s current fields
+(the simulation is only a container: `couple_step!` calls `update_steady_state!` once, then `step!`)."""
+function build_hydrology_sim_Aguamenti(yelmo)
+    T = Float64
+    Nx, Ny = yelmo.g.Nx, yelmo.g.Ny
+    xlims  = (0, T(yelmo.g.Δxᶜᵃᵃ * Nx))
+    ylims  = (0, T(yelmo.g.Δyᵃᶜᵃ * Ny))
+    grid   = ArrayHydroGrid(Nx, Ny, xlims, ylims; T = T)
+    sliding_law = K24_SLIDING == "field" ? PrescribedFieldSlidingLaw(grid, T.(interior(yelmo.dyn.taub, :, :, 1))) :
+                                           NoFrictionSlidingLaw()
+    model = AguamentiHydroModel(grid, _agu_kappa(yelmo), T.(perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1))),
+                                T.(_A_visc(yelmo)), T.(_G(yelmo)), T.(_q_T(yelmo));
+                                i_eb = T.(perYear2perSecond.(_melt_int(yelmo) .* RHO_I)), cold = _agu_cold(yelmo),
+                                rho_i = RHO_I, L_w = L_ICE, sliding_law = sliding_law,
+                                routing_options = (; fill_iters = 10))
+    state = HydroState(grid, HydroMask(_fh_mask(yelmo)), T.(interior(yelmo.tpo.H_ice, :, :, 1)), T.(interior(yelmo.bnd.z_bed, :, :, 1)))
+    AGU_SPUN_UP[] = false
+    return SteadyStateSimulation(model, grid, state)
+end
+
+"""Copy Yelmo fields → FastHydrology state/model (Aguamenti). The soft-bed fraction stays as built."""
+function Yelmo_to_FastHydrology_Aguamenti!(sim, yelmo)
+    sim.state.mask .= _fh_mask(yelmo)
+    sim.state.h    .= interior(yelmo.tpo.H_ice, :, :, 1)
+    sim.state.b    .= interior(yelmo.bnd.z_bed, :, :, 1)
+    set_aguamenti_inputs!(sim.model; abs_v_b = perYear2perSecond.(interior(yelmo.dyn.uxy_b, :, :, 1)),
+                          A_visc = _A_visc(yelmo), G = _G(yelmo), q_T = _q_T(yelmo),
+                          i_eb = perYear2perSecond.(_melt_int(yelmo) .* RHO_I), cold = _agu_cold(yelmo))
+    K24_SLIDING == "field" && (sim.model.sliding_law.tau_b .= interior(yelmo.dyn.taub, :, :, 1))   # [Pa]
+end
+
+"""Copy FastHydrology outputs → Yelmo boundary fields (Aguamenti): the sliding pressure N, and Yelmo's
+basal water H_w, which its thermal boundary condition reads as "is there water at the bed": the mean
+height of the distributed water layer in wet cells, and Yelmo's full till store (yhyd.W_til_max) in
+temperate cells the till leaves dry but that it still supplies (soft bed, freeze-on covered by the
+till), so they stay at the pressure-melting point; 0 in cold cells and dry hard-bed cells."""
+function FastHydrology_to_Yelmo_Aguamenti!(yelmo, sim)
+    yelmo.dyn.N_eff .= sim.state.N
+    m = sim.model
+    W_til_max = hasproperty(yelmo, :p) ? Float64(yelmo.p.yhyd.W_til_max) : 2.0
+    till_fed = (m.regime .== FastHydrology.AGUAMENTI_DRY) .& (m.kappa .> 0) .& (m.freeze_deficit .<= 0)
+    yelmo.thrm.H_w .= ifelse.(till_fed, max.(sim.state.W, W_til_max), sim.state.W)
+end
+
+function couple_step!(::AguamentiHydroModel, sim, yelmo, dt; frozen_bed_threshold = nothing)
+    Yelmo_to_FastHydrology_Aguamenti!(sim, yelmo)
+    if !AGU_SPUN_UP[]
+        for _ in 1:parse(Int, get(ENV, "AGU_SPINUP", "1"))
+            update_steady_state!(sim.model, sim.grid, sim.state)
+        end
+        AGU_SPUN_UP[] = true
+    else
+        dH_dt = perYear2perSecond.(Float64.(interior(yelmo.tpo.dHidt, :, :, 1)))
+        FastHydrology.step!(sim.model, sim.grid, sim.state, dt * AGU_SECONDS_PER_YEAR; dH_dt)
+    end
+    FastHydrology_to_Yelmo_Aguamenti!(yelmo, sim)
 end
 
 # ── HAB (height above buoyancy): build + coupling functions ───────────────────
